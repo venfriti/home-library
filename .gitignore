@@ -1,0 +1,6 @@
+config.json
+*.exe
+*.exe~
+*.log
+local_subs_cache/
+local_thumbs_cache/
