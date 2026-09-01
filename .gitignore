@@ -4,3 +4,9 @@ config.json
 *.log
 local_subs_cache/
 local_thumbs_cache/
+local_meta.backup-*.json
+metadata-backups/
+playlists.json
+watch_history.json
+playback_progress.json
+swap-result.txt

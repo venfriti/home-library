@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" width="200" height="200">
+  <rect width="200" height="200" rx="36" fill="#110F0D"/>
+
+  <!-- Cradle base -->
+  <rect x="52" y="128" width="96" height="20" rx="3" fill="none" stroke="#9A7D4A" stroke-width="3" stroke-linejoin="round"/>
+
+  <!-- Cradle left wall -->
+  <line x1="52" y1="128" x2="52" y2="104" stroke="#9A7D4A" stroke-width="3" stroke-linecap="round"/>
+
+  <!-- Cradle right wall -->
+  <line x1="148" y1="128" x2="148" y2="104" stroke="#9A7D4A" stroke-width="3" stroke-linecap="round"/>
+
+  <!-- Play triangle -->
+  <path d="M82,50 L136,82 L82,114 Z" fill="#1C1915" stroke="#D4CFC8" stroke-width="2.5" stroke-linejoin="round"/>
+
+  <!-- Motion lines left of the triangle — stream indication -->
+  <line x1="56" y1="58" x2="70" y2="58" stroke="#5A554E" stroke-width="2" stroke-linecap="round"/>
+  <line x1="56" y1="70" x2="70" y2="70" stroke="#5A554E" stroke-width="2" stroke-linecap="round"/>
+  <line x1="56" y1="82" x2="70" y2="82" stroke="#3A3530" stroke-width="2" stroke-linecap="round"/>
+</svg>
