@@ -57,6 +57,10 @@ const (
 	defaultPort       = 5746
 	maxLoginFailures  = 10
 	loginLockDuration = 15 * time.Minute
+	// maxLogSize gates the startup rotation in runAsService -- stream.log is
+	// opened O_APPEND with nothing else capping its growth, so a service that
+	// runs for months without a redeploy would otherwise log forever.
+	maxLogSize = 10 * 1024 * 1024
 	// How many times a file with no TMDB match is retried before it is left
 	// alone. Manual re-enrichment always overrides this.
 	maxEnrichTries = 4
@@ -103,6 +107,20 @@ type Config struct {
 	// to it; empty disables PGS OCR entirely (a text subtitle, when one
 	// exists, is unaffected either way).
 	PgsToSrtPath string `json:"pgstosrt_path,omitempty"`
+	// MkvpropeditPath/MkvmergePath are MKVToolNix's own tools, preferred over
+	// ffmpeg for a Matroska file's audio/subtitle default-track fix wherever
+	// they can do the job (see remuxWithDefaults): mkvpropedit edits
+	// container flags in place with no re-mux at all, and mkvmerge — when
+	// tracks genuinely need physically reordering — repacks the file with
+	// the exact tool that made it in the first place. Both matter because
+	// ffmpeg's own remux, while perfectly valid and decodable by ffmpeg/VLC/
+	// etc, was found to silently break EAC3 audio decode in Microsoft Edge
+	// specifically — different muxer bitstream framing that browser's own
+	// strict built-in decoder didn't tolerate even though nothing else
+	// tested didn't. Empty falls back to the ffmpeg path for every file,
+	// .mkv included, same as before either tool existed.
+	MkvpropeditPath string `json:"mkvpropedit_path,omitempty"`
+	MkvmergePath    string `json:"mkvmerge_path,omitempty"`
 	LLMProvider     string `json:"llm_provider,omitempty"`
 	LLMModel        string `json:"llm_model,omitempty"`
 	LLMBaseURL      string `json:"llm_base_url,omitempty"`
@@ -131,7 +149,8 @@ type Config struct {
 	// R2/Cloudflare, no transcoding. Played inline when browser-compatible,
 	// otherwise opened in a desktop app on the host. Type defaults to "video"
 	// (TMDB/LLM movie & TV enrichment); "music_video" routes filename parsing
-	// + metadata lookup to iTunes instead, skipping TMDB/Ollama entirely.
+	// + artist/title split instead, skipping TMDB/Ollama entirely — no
+	// external metadata lookup at all (see parseMusicVideoFilename).
 	LocalLibraryFolders []LocalFolder `json:"local_library_folders,omitempty"`
 	// Sharing a session with FileDrop. Cookies are scoped by host and ignore
 	// the port, so both apps on the same machine see the same cookie jar:
@@ -156,6 +175,15 @@ var (
 	cfgPath string
 	logger  *log.Logger
 )
+
+// dataDir is where every piece of persistent server state lives -- local
+// library metadata, playlists, watch history, caches -- keeping the repo
+// root itself down to source files, the config, and the running binary.
+func dataDir() string {
+	d := filepath.Join(filepath.Dir(cfgPath), "data")
+	os.MkdirAll(d, 0755)
+	return d
+}
 
 // tmdbHTTPClient bounds TMDB requests — package-level http.Get has no
 // timeout at all, so a single stalled connection would otherwise hang
@@ -205,6 +233,17 @@ func ffprobeBin() string {
 // tool has no common system-wide install a bare command name would find.
 func pgsToSrtBin() string {
 	return cfg.PgsToSrtPath
+}
+
+// mkvpropeditBin/mkvmergeBin: empty means "not configured", which every
+// caller treats as "skip this tool, fall back to ffmpeg" rather than
+// falling back to a bare command name on PATH — MKVToolNix has no ubiquitous
+// system-wide install ffmpeg/ffprobe can assume the way those two do.
+func mkvpropeditBin() string {
+	return cfg.MkvpropeditPath
+}
+func mkvmergeBin() string {
+	return cfg.MkvmergePath
 }
 
 // ─── Rate limiting ────────────────────────────────────────────────────────────
@@ -333,6 +372,14 @@ func (c *serverCtx) cookieKey() string {
 }
 
 func (c *serverCtx) isAuthed(r *http.Request) bool {
+	// The password protects the public Cloudflare Tunnel endpoint, not
+	// access from the home network itself -- a request that never left the
+	// LAN (see isLocalRequest) is trusted without a session, so browsing
+	// from this machine or the Windows app on the same network never has to
+	// log in at all.
+	if isLocalRequest(r) {
+		return true
+	}
 	ck, err := r.Cookie(c.cookieKey())
 	if err != nil {
 		return false
@@ -506,7 +553,10 @@ type videoMeta struct {
 	EpisodeStill   string   `json:"episode_still,omitempty"`
 	SubtitleURL    string   `json:"subtitle_url,omitempty"`
 	Runtime        int      `json:"runtime,omitempty"` // TMDB's official runtime in minutes (movies only)
-	// Music video fields (iTunes Search API, not TMDB) — Title holds the song.
+	// Music video fields, parsed straight from the filename (see
+	// parseMusicVideoFilename) rather than any external lookup — Title holds
+	// the song. Album has no filename equivalent and is currently never set;
+	// kept for API compatibility rather than removed outright.
 	Artist string `json:"artist,omitempty"`
 	Album  string `json:"album,omitempty"`
 	// Film-level detail (movies only)
@@ -877,7 +927,35 @@ func extractEmbeddedSubtitle(inPath string, streamIndex int, outPath string) err
 	if err != nil {
 		return fmt.Errorf("%v: %s", err, truncateForLog(out))
 	}
+	if err := normalizeVTTTimestamps(outPath); err != nil {
+		return fmt.Errorf("normalize timestamps: %v", err)
+	}
 	return nil
+}
+
+// webvttShortTimestamp matches a WebVTT cue-timing line in ffmpeg's own
+// MM:SS.mmm form, which it emits whenever the hour is zero -- true for
+// essentially every TV episode, since none run an hour long. The
+// OpenSubtitles/sidecar path (see srtToVTT) never hits this: SRT always
+// carries a full HH:MM:SS timestamp, passed through as-is.
+var webvttShortTimestamp = regexp.MustCompile(`(?m)^(\d{2}:\d{2}\.\d{3}) --> (\d{2}:\d{2}\.\d{3})`)
+
+// normalizeVTTTimestamps rewrites a WebVTT file's cue timings to always
+// carry the hour field. Confirmed on a Hisense/VIDAA TV: its subtitle
+// renderer silently drops every cue in the shorter MM:SS.mmm form even
+// though the browser's own text-track API parses them fine (cues.length
+// still reports them, which is what makes this easy to miss from script
+// alone) -- padding in a leading "00:" is enough to make it render them.
+func normalizeVTTTimestamps(path string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	fixed := webvttShortTimestamp.ReplaceAll(data, []byte("00:$1 --> 00:$2"))
+	if bytes.Equal(fixed, data) {
+		return nil
+	}
+	return os.WriteFile(path, fixed, 0644)
 }
 
 // findEmbeddedPGSSubtitle returns the absolute stream index of the source's
@@ -1012,7 +1090,7 @@ var (
 )
 
 func localSubtitleCacheDir() string {
-	dir := filepath.Join(filepath.Dir(cfgPath), "local_subs_cache")
+	dir := filepath.Join(dataDir(), "local_subs_cache")
 	os.MkdirAll(dir, 0755)
 	return dir
 }
@@ -1081,15 +1159,15 @@ var (
 )
 
 func localThumbnailCacheDir() string {
-	dir := filepath.Join(filepath.Dir(cfgPath), "local_thumbs_cache")
+	dir := filepath.Join(dataDir(), "local_thumbs_cache")
 	os.MkdirAll(dir, 0755)
 	return dir
 }
 
 // localThumbnailPath finds or creates a cached still frame pulled from the
-// video itself — used for music video cards, which otherwise had nothing
-// but an iTunes album-cover for a thumbnail, a fundamentally different
-// piece of art than what's actually playing. Returns "" if extraction fails.
+// video itself — used for music video cards, which have no other source of
+// cover art now that identification is pure filename parsing rather than an
+// iTunes lookup. Returns "" if extraction fails.
 var thumbSem = make(chan struct{}, 3)
 
 func localThumbnailPath(absVideoPath string) string {
@@ -1137,6 +1215,77 @@ func extractThumbnail(inPath, outPath string, durationSec int) error {
 	seek := "00:00:05"
 	if durationSec > 0 && durationSec < 10 {
 		seek = "00:00:00"
+	}
+	return exec.Command(ffmpegBin(),
+		"-y",
+		"-ss", seek,
+		"-i", inPath,
+		"-frames:v", "1",
+		"-q:v", "3",
+		"-vf", "scale=640:-1",
+		outPath,
+	).Run()
+}
+
+// localThumbnailAltCache mirrors localThumbnailCache but for a second, later
+// frame of the same video -- see localThumbnailPathAlt.
+var (
+	localThumbnailAltMu    sync.Mutex
+	localThumbnailAltCache = map[string]string{}
+)
+
+// localThumbnailPathAlt is localThumbnailPath's counterpart for a single-item
+// playlist's cover: composePlaylistCover would otherwise show the exact same
+// frame extractThumbnail already grabbed for that video's own card elsewhere
+// on the wall, making the playlist look like a duplicate of one file rather
+// than its own thing. Cached separately (same directory, ".alt.jpg" suffix)
+// so it costs one extra ffmpeg grab per video, not one per cover render.
+func localThumbnailPathAlt(absVideoPath string) string {
+	localThumbnailAltMu.Lock()
+	if p, ok := localThumbnailAltCache[absVideoPath]; ok {
+		localThumbnailAltMu.Unlock()
+		return p
+	}
+	localThumbnailAltMu.Unlock()
+
+	cachePath := filepath.Join(localThumbnailCacheDir(), hex.EncodeToString(sha256Sum(absVideoPath))+".alt.jpg")
+	result := cachePath
+	if !fileExists(cachePath) {
+		thumbSem <- struct{}{}
+		defer func() { <-thumbSem }()
+		if fileExists(cachePath) {
+			localThumbnailAltMu.Lock()
+			localThumbnailAltCache[absVideoPath] = cachePath
+			localThumbnailAltMu.Unlock()
+			return cachePath
+		}
+		meta, isVideo, _ := probeVideo(absVideoPath)
+		dur := 0
+		if isVideo {
+			dur = meta.Duration
+		}
+		if err := extractThumbnailAlt(absVideoPath, cachePath, dur); err != nil || !fileExists(cachePath) {
+			result = ""
+		}
+	}
+	if result != "" {
+		localThumbnailAltMu.Lock()
+		localThumbnailAltCache[absVideoPath] = result
+		localThumbnailAltMu.Unlock()
+	}
+	return result
+}
+
+// extractThumbnailAlt grabs a visibly different point in the video than
+// extractThumbnail's fixed 5s (or shorter clips scale down proportionally
+// instead of colliding with it at 0s too).
+func extractThumbnailAlt(inPath, outPath string, durationSec int) error {
+	seek := "00:00:20"
+	switch {
+	case durationSec > 0 && durationSec < 10:
+		seek = "00:00:00"
+	case durationSec > 0 && durationSec < 40:
+		seek = fmt.Sprintf("00:00:%02d", durationSec/2)
 	}
 	return exec.Command(ffmpegBin(),
 		"-y",
@@ -2599,7 +2748,7 @@ var (
 	historyCache = map[string]watchRecord{}
 )
 
-func historyPath() string { return filepath.Join(filepath.Dir(cfgPath), "watch_history.json") }
+func historyPath() string { return filepath.Join(dataDir(), "watch_history.json") }
 
 func loadHistory() {
 	data, err := os.ReadFile(historyPath())
@@ -2749,10 +2898,10 @@ var (
 	playlistCache = map[string]*playlist{}
 )
 
-func playlistPath() string { return filepath.Join(filepath.Dir(cfgPath), "playlists.json") }
+func playlistPath() string { return filepath.Join(dataDir(), "playlists.json") }
 
 func playlistCoverDir() string {
-	d := filepath.Join(filepath.Dir(cfgPath), "playlist_covers")
+	d := filepath.Join(dataDir(), "playlist_covers")
 	os.MkdirAll(d, 0755)
 	return d
 }
@@ -2765,6 +2914,15 @@ func loadPlaylists() {
 	playlistMu.Lock()
 	defer playlistMu.Unlock()
 	json.Unmarshal(data, &playlistCache)
+	// Self-heals any playlist saved with a nil Items slice (see the "create"
+	// case above) -- a nil slice round-trips through JSON as null, and the
+	// client's pl.items.length has no way to know that's meant to be empty
+	// rather than broken.
+	for _, pl := range playlistCache {
+		if pl.Items == nil {
+			pl.Items = []string{}
+		}
+	}
 }
 
 func savePlaylists() {
@@ -2821,7 +2979,11 @@ func (c *serverCtx) handlePlaylists(w http.ResponseWriter, r *http.Request) {
 			if name == "" {
 				name = "Untitled playlist"
 			}
-			pl := &playlist{ID: newPlaylistID(), Name: name, Created: now, Updated: now}
+			// Items always starts as a real (if empty) slice, never a nil one --
+			// a nil []string marshals to JSON null rather than [], and the
+			// client's pl.items.length blew up on that the moment a playlist
+			// was created with no seed video to populate it from.
+			pl := &playlist{ID: newPlaylistID(), Name: name, Items: []string{}, Created: now, Updated: now}
 			if body.Key != "" {
 				pl.Items = []string{body.Key}
 			}
@@ -2892,6 +3054,26 @@ func (c *serverCtx) handlePlaylists(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// handleWindowsAppVersion lets the native Windows client (see windows/) check
+// for a newer release. The source of truth is a hand-edited JSON file --
+// there's no build/release pipeline for that app, so bumping the version
+// here is a manual step whenever a new build gets published somewhere
+// reachable (e.g. uploaded to R2 alongside the video library). No file yet
+// means no release has been published, not an error.
+func (c *serverCtx) handleWindowsAppVersion(w http.ResponseWriter, r *http.Request) {
+	if !c.isAuthed(r) {
+		http.Error(w, "unauthorized", 401)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	data, err := os.ReadFile(filepath.Join(dataDir(), "windows_app_version.json"))
+	if err != nil {
+		fmt.Fprint(w, "{}")
+		return
+	}
+	w.Write(data)
+}
+
 // scaleInto does a nearest-neighbour draw of src into the given rect. A cover
 // tile is 320x180 and never looked at closely, so this is enough and avoids
 // pulling in an image-resizing dependency.
@@ -2917,67 +3099,61 @@ func scaleInto(dst *image.RGBA, r image.Rectangle, src image.Image) {
 	}
 }
 
-// composePlaylistCover builds the 2x2 grid of the first four items' stills.
-// It is regenerated whenever the membership changes rather than cached
-// forever, since the cover is meant to describe what is currently in the list.
+// composePlaylistCover builds the playlist's default cover: a single still
+// from its first item, at a different timestamp than that same video's own
+// card thumbnail elsewhere on the wall (see localThumbnailPathAlt) -- so a
+// playlist reads as its own thing rather than a duplicate of a file sitting
+// right there on the wall. Regenerated whenever membership changes rather
+// than cached forever, since the cover is meant to describe what the
+// playlist currently starts with.
 func (c *serverCtx) composePlaylistCover(pl *playlist) ([]byte, error) {
 	const w, h = 640, 360
-	canvas := image.NewRGBA(image.Rect(0, 0, w, h))
-	draw.Draw(canvas, canvas.Bounds(), &image.Uniform{color.RGBA{20, 19, 15, 255}}, image.Point{}, draw.Src)
+	if len(pl.Items) == 0 {
+		return nil, fmt.Errorf("empty playlist")
+	}
 
-	// Gather what artwork actually exists first. A playlist whose files have
-	// not had a frame pulled yet would otherwise compose to a grid of holes.
-	var art []image.Image
+	// Some uploads are really just a song with a static square/4:3 profile
+	// picture standing in for a video -- picking one of those as the cover
+	// would look like a broken crop next to every other widescreen still in
+	// the app. Walk the playlist for the first item that's actually
+	// widescreen, falling back to the literal first item if none qualify
+	// (still a cover, just not necessarily the ideal item) rather than no
+	// cover at all.
+	pick := pl.Items[0]
 	for _, key := range pl.Items {
-		if len(art) >= 4 {
-			break
-		}
 		abs, ok := c.resolveLocalPath(key)
 		if !ok {
 			continue
 		}
-		tp := localThumbnailPath(abs)
-		if tp == "" {
-			continue
+		if meta, isVideo, _ := probeVideo(abs); isVideo && meta.Height > 0 &&
+			float64(meta.Width)/float64(meta.Height) >= 1.5 {
+			pick = key
+			break
 		}
-		f, err := os.Open(tp)
-		if err != nil {
-			continue
-		}
-		img, _, derr := image.Decode(f)
-		f.Close()
-		if derr == nil {
-			art = append(art, img)
-		}
-	}
-	if len(art) == 0 {
-		return nil, fmt.Errorf("no artwork yet")
 	}
 
-	// The layout follows the count, so the frame is always fully covered:
-	// one fills it, two split it, three give the first the left half, four
-	// make the quarters.
-	var cells []image.Rectangle
-	switch len(art) {
-	case 1:
-		cells = []image.Rectangle{image.Rect(0, 0, w, h)}
-	case 2:
-		cells = []image.Rectangle{image.Rect(0, 0, w/2, h), image.Rect(w/2, 0, w, h)}
-	case 3:
-		cells = []image.Rectangle{
-			image.Rect(0, 0, w/2, h),
-			image.Rect(w/2, 0, w, h/2),
-			image.Rect(w/2, h/2, w, h),
-		}
-	default:
-		cells = []image.Rectangle{
-			image.Rect(0, 0, w/2, h/2), image.Rect(w/2, 0, w, h/2),
-			image.Rect(0, h/2, w/2, h), image.Rect(w/2, h/2, w, h),
-		}
+	abs, ok := c.resolveLocalPath(pick)
+	if !ok {
+		return nil, fmt.Errorf("item not found")
 	}
-	for i, img := range art {
-		scaleInto(canvas, cells[i], img)
+	tp := localThumbnailPathAlt(abs)
+	if tp == "" {
+		return nil, fmt.Errorf("no artwork yet")
 	}
+	f, err := os.Open(tp)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	img, _, err := image.Decode(f)
+	if err != nil {
+		return nil, err
+	}
+
+	canvas := image.NewRGBA(image.Rect(0, 0, w, h))
+	draw.Draw(canvas, canvas.Bounds(), &image.Uniform{color.RGBA{20, 19, 15, 255}}, image.Point{}, draw.Src)
+	scaleInto(canvas, canvas.Bounds(), img)
+
 	var buf bytes.Buffer
 	if err := jpeg.Encode(&buf, canvas, &jpeg.Options{Quality: 82}); err != nil {
 		return nil, err
@@ -3580,29 +3756,6 @@ func (c *serverCtx) handleIndex(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (c *serverCtx) handlePresign(w http.ResponseWriter, r *http.Request) {
-	if !c.isAuthed(r) {
-		http.Error(w, "unauthorized", 401)
-		return
-	}
-	name := filepath.Base(r.URL.Query().Get("name"))
-	if name == "" || name == "." {
-		http.Error(w, "invalid name", 400)
-		return
-	}
-	pc := s3.NewPresignClient(c.r2)
-	result, err := pc.PresignPutObject(context.Background(), &s3.PutObjectInput{
-		Bucket: awsv2.String(c.r2Bucket),
-		Key:    awsv2.String(name),
-	}, s3.WithPresignExpires(15*time.Minute))
-	if err != nil {
-		http.Error(w, "presign failed", 500)
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"url": result.URL, "key": name})
-}
-
 func (c *serverCtx) handleConfirm(w http.ResponseWriter, r *http.Request) {
 	if !c.isAuthed(r) {
 		http.Error(w, "unauthorized", 401)
@@ -4152,6 +4305,51 @@ func markShowFeaturettes(videos []localVideo) {
 	}
 }
 
+// markMovieFeaturettes is markShowFeaturettes' movie-side counterpart, and
+// deliberately narrower than either automatic scheme markExtras' own
+// comment describes trying and reverting: it only ever fires on the same
+// unambiguous signal the show version uses -- an explicit extras-folder
+// name (see extrasFolders) -- never on "sits alongside the movie's own
+// file with no folder marker at all", which is exactly the shape that
+// produced those past false positives (a second, unrelated, not-yet-
+// identified movie sharing a plain folder with an identified one). A movie
+// whose bonus material has no such folder (this library's Before Trilogy
+// discs, for instance) still needs the hand-curated is_extra/main_key
+// markExtras reads, same as before this existed.
+func markMovieFeaturettes(videos []localVideo) {
+	movieFile := map[string]string{} // dir -> Rel of the movie whose own file lives there
+	for _, v := range videos {
+		vm, ok := getLocalMeta(v.Rel)
+		if !ok || vm.MediaType != "movie" || vm.TMDBID <= 0 {
+			continue
+		}
+		parts := strings.Split(v.Rel, "/")
+		if len(parts) < 2 {
+			continue
+		}
+		dir := strings.Join(parts[:len(parts)-1], "/")
+		movieFile[dir] = v.Rel
+	}
+	if len(movieFile) == 0 {
+		return
+	}
+	for i, v := range videos {
+		if videos[i].IsExtra {
+			continue
+		}
+		anchor, ok := featuretteAnchorDir(v.Rel)
+		if !ok {
+			continue
+		}
+		mainRel, ok := movieFile[anchor]
+		if !ok {
+			continue
+		}
+		videos[i].IsExtra = true
+		videos[i].MainRel = mainRel
+	}
+}
+
 // featuretteAnchorDir walks a file's path looking for an ancestor folder
 // named for exactly what isUnidentifiable already trusts as bonus material
 // (see extrasFolders) and, if found, returns the directory that folder
@@ -4298,6 +4496,7 @@ func (c *serverCtx) scanLocalVideos() []localVideo {
 	}
 	markExtras(out)
 	markShowFeaturettes(out)
+	markMovieFeaturettes(out)
 	return out
 }
 
@@ -4556,17 +4755,201 @@ func isSharingViolation(err error) bool {
 	return errors.As(err, &errno) && errno == 0x20
 }
 
-// remuxWithDefaults rewrites path so the chosen audio and subtitle streams
-// are both flagged default AND physically reordered to stream 0 of their
-// type -- via a stream-copy remux (-c copy), so every track is kept and none
-// is re-encoded; this only ever touches container structure/metadata. The
-// flag alone is not enough: plenty of real playback hardware (TV browsers in
-// particular) ignores the container's default disposition entirely and just
-// plays audio/subtitle stream 0, so that is the thing that actually has to
-// move. The swap is staged through a temp file and a rename-aside of the
-// original, so a failure at any point leaves the original file exactly as it
-// was.
+// looksLikeFileInUse is the external-tool equivalent of isSharingViolation
+// for mkvpropedit/mkvmerge, whose failures come back as a nonzero exit plus
+// stderr text rather than a Go syscall error isSharingViolation can type-
+// assert against. A best-effort text match, good enough for its one actual
+// job -- "retry later without burning an attempt" -- not for anything more.
+func looksLikeFileInUse(out []byte) bool {
+	s := strings.ToLower(string(out))
+	return strings.Contains(s, "sharing violation") ||
+		strings.Contains(s, "being used by another process") ||
+		strings.Contains(s, "locked by another process") ||
+		strings.Contains(s, "could not be opened for writing") ||
+		strings.Contains(s, "is being analyzed") ||
+		strings.Contains(s, "permission denied") ||
+		strings.Contains(s, "access is denied") ||
+		strings.Contains(s, "access denied")
+}
+
+// firstVideoStreamIndex is the one piece of information remuxWithMkvmerge
+// needs that probeAudioSubtitleStreams deliberately doesn't return (it only
+// ever looks at audio/subtitle) -- mkvmerge's --track-order has to name
+// every track explicitly, video included, or video gets pushed to the end.
+func firstVideoStreamIndex(path string) (int, error) {
+	out, err := exec.Command(ffprobeBin(), "-v", "error", "-select_streams", "v:0",
+		"-show_entries", "stream=index", "-of", "csv=p=0", path).Output()
+	if err != nil {
+		return 0, err
+	}
+	return strconv.Atoi(strings.TrimSpace(string(out)))
+}
+
+// remuxWithDefaults fixes which audio and subtitle track a file will
+// actually play by default -- see ensureAudioDefault for why the container's
+// default flag alone isn't enough on real hardware, which is why a genuine
+// reorder can't always be avoided. For a Matroska file it reaches for the
+// least invasive tool that can still do the job: mkvpropedit when only the
+// *flags* are wrong (no track data touched at all, so it cannot possibly be
+// the source of a playback regression), mkvmerge -- the tool that actually
+// made these files -- when tracks genuinely need reordering, and ffmpeg only
+// as the fallback for a non-Matroska container or when neither MKVToolNix
+// tool is configured. That fallback used to be the only path for every file
+// regardless of container: it silently broke EAC3 audio decode in Microsoft
+// Edge specifically (a different muxer's bitstream framing that browser's
+// own strict decoder wouldn't tolerate, despite the exact same output
+// decoding fine in ffmpeg, VLC, and everything else this was checked
+// against) even though it never touched the audio data itself.
 func remuxWithDefaults(path string, audios []mediaStream, preferredAudioIdx int, subs []mediaStream, englishSub *mediaStream) error {
+	isMkv := strings.ToLower(filepath.Ext(path)) == ".mkv"
+	needsAudioReorder := len(audios) > 0 && audios[0].Index != preferredAudioIdx
+	needsSubReorder := englishSub != nil && len(subs) > 0 && subs[0].Index != englishSub.Index
+
+	if isMkv && mkvpropeditBin() != "" && !needsAudioReorder && !needsSubReorder {
+		return setDefaultFlagsInPlace(path, audios, preferredAudioIdx, subs, englishSub)
+	}
+	if isMkv && mkvmergeBin() != "" {
+		return remuxWithMkvmerge(path, audios, preferredAudioIdx, subs, englishSub)
+	}
+	return remuxWithFfmpeg(path, audios, preferredAudioIdx, subs, englishSub)
+}
+
+// setDefaultFlagsInPlace fixes only the default-track flags on a Matroska
+// file via mkvpropedit. No stream is re-muxed, re-packaged, or even opened
+// for anything but the header — the one path here that is structurally
+// incapable of the Edge/EAC3 regression a full remux caused. Only reachable
+// when neither audio nor subtitle tracks need physically reordering (see
+// remuxWithDefaults); mkvpropedit has no way to do that part.
+func setDefaultFlagsInPlace(path string, audios []mediaStream, preferredAudioIdx int, subs []mediaStream, englishSub *mediaStream) error {
+	args := []string{path}
+	for i, a := range audios {
+		val := "0"
+		if a.Index == preferredAudioIdx {
+			val = "1"
+		}
+		args = append(args, "--edit", fmt.Sprintf("track:a%d", i+1), "--set", "flag-default="+val)
+	}
+	if englishSub != nil {
+		for i, s := range subs {
+			val := "0"
+			if s.Index == englishSub.Index {
+				val = "1"
+			}
+			args = append(args, "--edit", fmt.Sprintf("track:s%d", i+1), "--set", "flag-default="+val)
+		}
+	}
+	out, err := exec.Command(mkvpropeditBin(), args...).CombinedOutput()
+	if err != nil {
+		if looksLikeFileInUse(out) {
+			return fmt.Errorf("%w: %s", errFileInUse, truncateForLog(out))
+		}
+		return fmt.Errorf("mkvpropedit: %v: %s", err, truncateForLog(out))
+	}
+	return nil
+}
+
+// remuxWithMkvmerge physically reorders a Matroska file's tracks with the
+// tool that originally created it, staged through a temp file and a
+// rename-aside exactly like remuxWithFfmpeg below -- a failure at any point
+// leaves the original file exactly as it was.
+func remuxWithMkvmerge(path string, audios []mediaStream, preferredAudioIdx int, subs []mediaStream, englishSub *mediaStream) error {
+	dir := filepath.Dir(path)
+	tmp := filepath.Join(dir, "."+hex.EncodeToString(sha256Sum(path))[:12]+".audiofix"+filepath.Ext(path))
+	os.Remove(tmp)
+
+	videoIdx, verr := firstVideoStreamIndex(path)
+	if verr != nil {
+		return fmt.Errorf("could not determine video track: %v", verr)
+	}
+
+	orderedAudioIdx := []int{preferredAudioIdx}
+	for _, a := range audios {
+		if a.Index != preferredAudioIdx {
+			orderedAudioIdx = append(orderedAudioIdx, a.Index)
+		}
+	}
+	var orderedSubIdx []int
+	if englishSub != nil {
+		orderedSubIdx = append(orderedSubIdx, englishSub.Index)
+	}
+	for _, s := range subs {
+		if englishSub == nil || s.Index != englishSub.Index {
+			orderedSubIdx = append(orderedSubIdx, s.Index)
+		}
+	}
+
+	order := []string{fmt.Sprintf("0:%d", videoIdx)}
+	args := []string{"-o", tmp}
+	for i, idx := range orderedAudioIdx {
+		val := 0
+		if i == 0 {
+			val = 1
+		}
+		args = append(args, "--default-track-flag", fmt.Sprintf("%d:%d", idx, val))
+		order = append(order, fmt.Sprintf("0:%d", idx))
+	}
+	for i, idx := range orderedSubIdx {
+		val := 0
+		if i == 0 {
+			val = 1
+		}
+		args = append(args, "--default-track-flag", fmt.Sprintf("%d:%d", idx, val))
+		order = append(order, fmt.Sprintf("0:%d", idx))
+	}
+	args = append(args, "--track-order", strings.Join(order, ","), path)
+
+	out, err := exec.Command(mkvmergeBin(), args...).CombinedOutput()
+	if err != nil {
+		os.Remove(tmp)
+		if looksLikeFileInUse(out) {
+			return fmt.Errorf("%w: %s", errFileInUse, truncateForLog(out))
+		}
+		return fmt.Errorf("mkvmerge: %v: %s", err, truncateForLog(out))
+	}
+
+	origInfo, oerr := os.Stat(path)
+	newInfo, nerr := os.Stat(tmp)
+	if oerr != nil || nerr != nil || newInfo.Size() < origInfo.Size()/2 {
+		os.Remove(tmp)
+		return fmt.Errorf("remux output failed the size sanity check")
+	}
+	if _, isVideo, _ := probeVideo(tmp); !isVideo {
+		os.Remove(tmp)
+		return fmt.Errorf("remux output does not probe as a valid video")
+	}
+
+	backup := path + ".preaudiofix.bak"
+	os.Remove(backup)
+	if err := os.Rename(path, backup); err != nil {
+		os.Remove(tmp)
+		if isSharingViolation(err) {
+			return fmt.Errorf("%w: %v", errFileInUse, err)
+		}
+		return fmt.Errorf("could not stage original aside: %v", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		os.Rename(backup, path)
+		os.Remove(tmp)
+		if isSharingViolation(err) {
+			return fmt.Errorf("%w: %v", errFileInUse, err)
+		}
+		return fmt.Errorf("could not move remuxed file into place: %v", err)
+	}
+	os.Remove(backup)
+	return nil
+}
+
+// remuxWithFfmpeg is the original, container-agnostic fix: a stream-copy
+// remux (-c copy) that rewrites path so the chosen audio and subtitle
+// streams are both flagged default AND physically reordered to stream 0 of
+// their type. Every track is kept and none is re-encoded — this only ever
+// touches container structure/metadata — but rewrapping through ffmpeg's
+// own muxer is exactly what broke EAC3 audio in Microsoft Edge for a
+// Matroska file (see remuxWithDefaults), so this is now only reached for a
+// non-Matroska container or when MKVToolNix isn't configured. The swap is
+// staged through a temp file and a rename-aside of the original, so a
+// failure at any point leaves the original file exactly as it was.
+func remuxWithFfmpeg(path string, audios []mediaStream, preferredAudioIdx int, subs []mediaStream, englishSub *mediaStream) error {
 	dir := filepath.Dir(path)
 	tmp := filepath.Join(dir, "."+hex.EncodeToString(sha256Sum(path))[:12]+".audiofix"+filepath.Ext(path))
 	os.Remove(tmp)
@@ -4716,7 +5099,7 @@ var (
 )
 
 func localMetaPath() string {
-	return filepath.Join(filepath.Dir(cfgPath), "local_meta.json")
+	return filepath.Join(dataDir(), "local_meta.json")
 }
 
 func loadLocalMetaCache() {
@@ -4766,7 +5149,7 @@ var (
 )
 
 func progressPath() string {
-	return filepath.Join(filepath.Dir(cfgPath), "playback_progress.json")
+	return filepath.Join(dataDir(), "playback_progress.json")
 }
 
 func loadProgressCache() {
@@ -4978,7 +5361,10 @@ func (c *serverCtx) kickEnrichment() {
 }
 
 // extrasFolders are the folder names a disc rip puts its bonus material in.
-var extrasFolders = []string{"featurettes", "extras", "bonus", "behind the scenes", "deleted scenes"}
+// "nc" is the anime-fansub convention specifically for non-credits clips
+// (OP/ED) rather than a disc-rip term like the rest of this list, but it's
+// exactly as unambiguous a signal — a real title is never named just "nc".
+var extrasFolders = []string{"featurettes", "extras", "bonus", "behind the scenes", "deleted scenes", "nc"}
 
 // isUnidentifiable reports that a file should never be matched against TMDB.
 //
@@ -5364,11 +5750,15 @@ func (c *serverCtx) handleLocalXSPF(w http.ResponseWriter, r *http.Request) {
 }
 
 func (c *serverCtx) handleLocalThumbnail(w http.ResponseWriter, r *http.Request) {
-	if !c.isAuthed(r) {
+	path := r.URL.Query().Get("path")
+	// Same path-scoped token as /local/file (see fileTokenMAC) -- a caller
+	// that already minted one to play the file can reuse it for the card's
+	// thumbnail image without a second round-trip through /local/file-token.
+	if !c.isAuthed(r) && !c.validFileToken(path, r.URL.Query().Get("tok")) {
 		http.Error(w, "unauthorized", 401)
 		return
 	}
-	full, ok := c.resolveLocalPath(r.URL.Query().Get("path"))
+	full, ok := c.resolveLocalPath(path)
 	if !ok {
 		http.Error(w, "not found", 404)
 		return
@@ -5625,22 +6015,40 @@ a{color:inherit;text-decoration:none}
 #topbar{
   position:sticky;top:0;z-index:10;
   background-color:var(--bg);
-  background-image:radial-gradient(80% 55% at 50% 0%, color-mix(in srgb, var(--tint, rgb(154,125,74)) 28%, transparent), transparent 72%);
+  background-image:radial-gradient(80% 55% at 50% 0%, color-mix(in oklch, var(--tint, rgb(154,125,74)) 28%, transparent), transparent 72%);
   background-size:100% 100vh;background-repeat:no-repeat;background-position:left top;
   transition:background-image 420ms cubic-bezier(.4,0,.2,1);
 }
 body.light #topbar{
-  background-image:radial-gradient(80% 55% at 50% 0%, color-mix(in srgb, var(--tint, rgb(154,125,74)) 17%, transparent), transparent 72%);
+  background-image:radial-gradient(80% 55% at 50% 0%, color-mix(in oklch, var(--tint, rgb(154,125,74)) 17%, transparent), transparent 72%);
 }
 header{display:flex;align-items:center;gap:.6rem;padding:1.05rem max(var(--gutter),calc((100% - var(--shell))/2 + var(--gutter)));border-bottom:1px solid rgba(255,255,255,.05)}
 body.light header{border-bottom-color:rgba(0,0,0,.08)}
 /* Only present while a show/movie/playlist detail page is open (see
    renderGrid) -- living in the topbar rather than the page below it means it
    rides along for free wherever the topbar's own sticky behaviour already
-   keeps it, with no bespoke stickiness of its own to maintain. */
-#topbar-back{display:none;background:none;border:none;color:var(--muted);font-family:var(--font-mono);font-size:.78rem;letter-spacing:.05em;cursor:pointer;padding:0;white-space:nowrap}
-#topbar-back:hover{color:var(--gold)}
-.wordmark{font-family:var(--font-serif);font-size:1.1rem;font-weight:700;letter-spacing:.03em;color:var(--text);white-space:nowrap;margin-right:.35rem}
+   keeps it, with no bespoke stickiness of its own to maintain. A native back
+   control needs one fixed, always-top-left slot it never moves from --
+   previously this sat in the wide-screen margin or inline before the
+   wordmark depending on viewport width, which is exactly the kind of
+   relocation a real back button never does. Now it is simply the first thing
+   in the header, its own fixed-size circular icon button, so it never shares
+   space with or nudges the logo at any width; display:none still collapses
+   it to no width at all on the main page, which never shows it. */
+/* Sized to match .view-btn, the header's own existing icon button -- the
+   header has no fixed height of its own, so a taller control here (an
+   earlier 36px pass) stretched the whole bar taller than the main page's,
+   which never shows this button at all. */
+#topbar-back{
+  display:none;align-items:center;justify-content:center;flex-shrink:0;
+  width:28px;height:28px;margin-right:.1rem;
+  background:none;border:none;border-radius:50%;color:var(--text);cursor:pointer;
+  transition:background-color .15s ease,color .15s ease;
+}
+#topbar-back svg{width:16px;height:16px}
+#topbar-back:hover{background:rgba(255,255,255,.08);color:var(--gold)}
+body.light #topbar-back:hover{background:rgba(0,0,0,.06)}
+.wordmark{font-family:var(--font-serif);font-size:1.1rem;font-weight:700;letter-spacing:.03em;color:var(--text);white-space:nowrap;margin-right:.35rem;cursor:pointer}
 .wordmark span{color:var(--gold);font-weight:400;font-style:italic}
 .spacer{flex:1}
 .pill{font-size:.72rem;font-weight:500;letter-spacing:.06em;color:var(--muted);border:1px solid var(--border);padding:.3rem .8rem;border-radius:999px;white-space:nowrap}
@@ -5681,6 +6089,43 @@ body.light header{border-bottom-color:rgba(0,0,0,.08)}
 .sec-tag .n{font-family:var(--font-mono);font-size:.64rem;color:var(--muted)}
 .sec-tag:focus-visible{outline:2px solid var(--text);outline-offset:-2px;border-radius:2px}
 @media(prefers-reduced-motion:reduce){.sec-tag{transition:none}}
+
+/* ── Playlist sidebar ─────────────────────────────────────────────────────
+   The mirror of #section-tags above -- same margin, same width-gated
+   existence, just the left side instead of the right, and shown only while
+   the music section is actually on screen (see syncPlSidebarVisibility)
+   rather than the whole time. ── */
+#pl-sidebar{display:none}
+@media(min-width:1380px){
+  #pl-sidebar{
+    display:flex;flex-direction:column;
+    position:fixed;z-index:5;
+    right:calc(50% + var(--shell) / 2 + 26px);
+    top:104px;
+    width:180px;max-height:min(60vh,420px);overflow-y:auto;
+    border-right:1px solid var(--border);padding-right:1.15rem;
+    opacity:0;transform:translateX(-8px);pointer-events:none;
+    transition:opacity .3s ease,transform .3s ease;
+  }
+  #pl-sidebar.visible{opacity:1;transform:translateX(0);pointer-events:auto}
+}
+.pls-item{
+  display:flex;align-items:center;gap:.55rem;width:100%;background:none;border:none;
+  padding:.4rem .3rem;border-radius:6px;cursor:pointer;text-align:left;
+  font-family:var(--font-sans);font-size:.8rem;color:var(--muted);
+  transition:color .15s ease,background .15s ease,outline-color .15s ease;
+  outline:2px solid transparent;outline-offset:-2px;
+}
+.pls-item:hover,.pls-item:focus-visible{color:var(--text);background:var(--bg2)}
+.pls-dot{flex-shrink:0;width:6px;height:6px;border-radius:50%;background:var(--border)}
+.pls-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pls-n{flex-shrink:0;font-family:var(--font-mono);font-size:.62rem;color:var(--muted)}
+.pls-empty{font-family:var(--font-sans);font-size:.76rem;color:var(--muted);padding:.3rem .3rem .7rem}
+.pls-create{color:var(--muted);font-family:var(--font-mono);font-size:.72rem;letter-spacing:.03em;
+  border-top:1px solid var(--border);margin-top:.3rem;padding-top:.65rem}
+.pls-create:hover{color:var(--gold);background:none}
+/* Drop feedback while dragging a music card over a sidebar entry. */
+.pls-item.drop-target{background:var(--bg3);outline-color:var(--gold)}
 .header-btn{background:none;border:1px solid var(--border);color:var(--muted);font-family:inherit;font-size:.72rem;font-weight:500;letter-spacing:.06em;padding:.3rem .8rem;border-radius:999px;cursor:pointer;white-space:nowrap;transition:border-color .15s,color .15s}
 .header-btn:hover,.header-btn.active{border-color:var(--gold);color:var(--gold)}
 
@@ -5706,14 +6151,14 @@ body.light header{border-bottom-color:rgba(0,0,0,.08)}
 #tint{
   position:fixed;inset:0;z-index:0;pointer-events:none;
   background:
-    radial-gradient(80% 55% at 50% 0%, color-mix(in srgb, var(--tint, rgb(154,125,74)) 28%, transparent), transparent 72%),
-    radial-gradient(120% 90% at 50% 100%, color-mix(in srgb, var(--tint, rgb(154,125,74)) 9%, transparent), transparent 60%);
+    radial-gradient(80% 55% at 50% 0%, color-mix(in oklch, var(--tint, rgb(154,125,74)) 28%, transparent), transparent 72%),
+    radial-gradient(120% 90% at 50% 100%, color-mix(in oklch, var(--tint, rgb(154,125,74)) 9%, transparent), transparent 60%);
   transition:background 420ms cubic-bezier(.4,0,.2,1),opacity .6s ease;
 }
 body.light #tint{
   background:
-    radial-gradient(80% 55% at 50% 0%, color-mix(in srgb, var(--tint, rgb(154,125,74)) 17%, transparent), transparent 72%),
-    radial-gradient(120% 90% at 50% 100%, color-mix(in srgb, var(--tint, rgb(154,125,74)) 6%, transparent), transparent 60%);
+    radial-gradient(80% 55% at 50% 0%, color-mix(in oklch, var(--tint, rgb(154,125,74)) 17%, transparent), transparent 72%),
+    radial-gradient(120% 90% at 50% 100%, color-mix(in oklch, var(--tint, rgb(154,125,74)) 6%, transparent), transparent 60%);
 }
 /* Lift content above the wash. #topbar is deliberately absent — it is already
    position:sticky and relisting it here would quietly override that. */
@@ -5725,29 +6170,79 @@ body.light #tint{
    hasActiveQueue) -- a session, not a single thing paused in the corner --
    and the wall says so on its own: one large radial tint of the playing
    track's own colour (--tint-playing, set once per track in openFile — see
-   setNowPlayingTint), sitting behind everything and centred near the
-   player's own corner, breathing in opacity rather than moving or changing
-   size. Home wall only, playing only -- a show/movie/playlist page is
-   untouched, and pausing (or ending the session) fades it out entirely
-   rather than just freezing it in place; see updateNowPlayingWash. While
-   it's showing, the wash is the *only* accent: the ordinary top-of-page
-   #tint hides outright (html.wash-active below) rather than just sitting
-   there unchanging underneath it, and hovering a card is suspended too (see
-   tintWashActive) so nothing fights the wash for the same visual role. */
+   setNowPlayingTint), sitting behind everything, breathing in opacity and
+   travelling the screen's edges -- bottom-right corner, along the bottom to
+   dead centre, then up the middle to the top -- rather than sitting still.
+   The two motions run on their own independent, non-matching durations
+   (opacity's 7s against the path's 14s) so the combination never quite
+   repeats the same beat twice. Home wall only, playing only -- a show/movie/
+   playlist page is untouched, and pausing (or ending the session) fades it
+   out entirely rather than just freezing it in place; see
+   updateNowPlayingWash. While it's showing, the wash is the *only* accent:
+   the ordinary top-of-page #tint hides outright (html.wash-active below)
+   rather than just sitting there unchanging underneath it, and hovering a
+   card is suspended too (see tintWashActive) so nothing fights the wash for
+   the same visual role. */
 @property --tint-playing {
   syntax: '<color>';
   inherits: true;
   initial-value: rgb(154,125,74);
 }
+/* Registered as real <percentage> values (the same Houdini trick --tint
+   itself needs to transition as a colour) so the browser can actually
+   interpolate the gradient's centre between keyframes instead of snapping. */
+@property --wash-x { syntax: '<percentage>'; inherits: true; initial-value: 85%; }
+@property --wash-y { syntax: '<percentage>'; inherits: true; initial-value: 90%; }
 html.wash-active #tint{opacity:0}
+/* Two things were quietly compounding to dim this well below the .2-1
+   opacity range actually reaching the screen: 28% was how much of the tint
+   colour was in the mix at all (the rest was see-through to the near-black
+   page behind it, which reads as just a darker version of the colour, not
+   the colour itself), and the gradient had no held peak -- it started
+   fading the instant it left dead centre, so even its brightest instant was
+   one point, not an area. Raised the mix and given it a plateau before the
+   fade starts, so the colour itself is stronger and covers more ground at
+   the same opacity.
+   The long fade to transparent (35%-78%) is exactly the shape that shows
+   8-bit banding worst -- wide, low-contrast, over near-black -- and this
+   one moves and pulses, so any banding reads as crawling rings rather than
+   a static artifact easy to miss. color-mix in oklch instead of the default
+   srgb takes a perceptually-uniform path between the two colours, which is
+   visibly smoother for this kind of fade -- same endpoints, same opacity,
+   just a straighter line between them. */
 #tint-wash{
   position:fixed;inset:0;z-index:0;pointer-events:none;
-  background:radial-gradient(ellipse at 82% 92%, color-mix(in srgb, var(--tint-playing, rgb(154,125,74)) 28%, transparent), transparent 60%);
+  background:radial-gradient(ellipse at var(--wash-x) var(--wash-y),
+    color-mix(in oklch, var(--tint-playing, rgb(154,125,74)) 55%, transparent) 0%,
+    color-mix(in oklch, var(--tint-playing, rgb(154,125,74)) 55%, transparent) 35%,
+    transparent 78%);
   opacity:0;transition:opacity .6s ease;
 }
-#tint-wash.on{opacity:.4;animation:tintWashPulse 7s ease-in-out infinite}
-@keyframes tintWashPulse{0%,100%{opacity:.4}50%{opacity:.75}}
-@media(prefers-reduced-motion:reduce){#tint-wash.on{animation:none;opacity:.55}}
+#tint-wash.on{
+  opacity:.2;
+  animation:tintWashPulse 13s ease-in-out infinite, tintWashMove 26s ease-in-out infinite alternate;
+}
+@keyframes tintWashPulse{0%,100%{opacity:.2}50%{opacity:.5}}
+@keyframes tintWashMove{
+  0%   { --wash-x: 85%; --wash-y: 90%; }
+  50%  { --wash-x: 50%; --wash-y: 92%; }
+  100% { --wash-x: 50%; --wash-y: 8%; }
+}
+@media(prefers-reduced-motion:reduce){#tint-wash.on{animation:none;opacity:.4}}
+/* Light mode's own background is already bright, so the same peak that
+   reads as a rich glow against near-black washes out into a pale haze here
+   instead -- the accent hue gets lost in it rather than shown by it. Same
+   timing/easing (and the same travelling path) throughout, just a lower
+   opacity range. */
+@keyframes tintWashPulseLight{0%,100%{opacity:.12}50%{opacity:.24}}
+body.light #tint-wash.on{
+  opacity:.12;
+  animation:tintWashPulseLight 13s ease-in-out infinite, tintWashMove 26s ease-in-out infinite alternate;
+}
+body.light #tint-wash{background:radial-gradient(ellipse at var(--wash-x) var(--wash-y),
+  color-mix(in oklch, var(--tint-playing, rgb(154,125,74)) 65%, transparent) 0%,
+  color-mix(in oklch, var(--tint-playing, rgb(154,125,74)) 65%, transparent) 35%,
+  transparent 78%)}
 
 /* Management controls hidden when viewing remotely (through the tunnel) */
 body.remote .mgmt{display:none!important}
@@ -5775,6 +6270,77 @@ body.remote .mgmt{display:none!important}
 #toast{position:fixed;left:50%;bottom:2rem;transform:translateX(-50%) translateY(1rem);background:var(--bg3);border:1px solid var(--gold);color:var(--text);padding:.65rem 1.1rem;border-radius:6px;font-size:.8rem;box-shadow:0 6px 24px rgba(0,0,0,.5);opacity:0;pointer-events:none;transition:opacity .2s,transform .2s;z-index:300;max-width:80vw}
 #toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
 #toast.err{border-color:#e06c6c}
+
+/* ── Queue drawer ─────────────────────────────────────────────────────────
+   A right-side panel rather than a modal dialog -- it's meant to be checked
+   and dismissed without interrupting whatever's playing behind it, the same
+   reasoning as the mini player itself. ── */
+#queue-scrim{position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:260;opacity:0;pointer-events:none;transition:opacity .25s ease}
+#queue-scrim.open{opacity:1;pointer-events:auto}
+#queue-drawer{
+  position:fixed;top:0;right:0;bottom:0;width:min(380px,88vw);z-index:261;
+  background:var(--bg2);border-left:1px solid var(--border);
+  box-shadow:-12px 0 36px rgba(0,0,0,.4);
+  display:flex;flex-direction:column;
+  transform:translateX(100%);transition:transform .28s cubic-bezier(.22,.61,.36,1);
+}
+#queue-drawer.open{transform:translateX(0)}
+#queue-head{
+  display:flex;align-items:center;justify-content:space-between;flex-shrink:0;
+  padding:1.1rem 1.2rem;border-bottom:1px solid var(--border);
+  font-family:var(--font-mono);font-size:.72rem;letter-spacing:.15em;text-transform:uppercase;color:var(--muted);
+}
+#queue-close{background:none;border:none;color:var(--muted);font-size:1.4rem;line-height:1;cursor:pointer;padding:0}
+#queue-close:hover{color:var(--text)}
+#queue-list{flex:1;overflow-y:auto;padding:.5rem}
+.queue-empty{color:var(--muted);font-size:.85rem;font-family:var(--font-sans);line-height:1.6;padding:1.5rem 1rem;text-align:center}
+.queue-row{display:flex;align-items:center;gap:.8rem;padding:.6rem;border-radius:8px;cursor:pointer;transition:background .15s ease}
+.queue-row:hover{background:var(--bg3)}
+.queue-shot{flex-shrink:0;width:84px;aspect-ratio:16/9;border-radius:5px;overflow:hidden;background:var(--bg);position:relative}
+.queue-shot img{width:100%;height:100%;object-fit:cover;display:block}
+.queue-noshot{display:flex;align-items:center;justify-content:center;height:100%;color:var(--muted);font-size:.9rem}
+.queue-info{flex:1;min-width:0}
+.queue-title{font-family:var(--font-sans);font-size:.85rem;color:var(--text);line-height:1.3;
+  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.queue-sub{font-family:var(--font-mono);font-size:.66rem;color:var(--muted);margin-top:.25rem;letter-spacing:.03em}
+.queue-remove{flex-shrink:0;background:none;border:none;color:var(--muted);font-size:.85rem;cursor:pointer;
+  padding:.3rem;border-radius:4px;opacity:0;transition:opacity .15s ease,color .15s ease}
+.queue-row:hover .queue-remove,.queue-remove:focus-visible{opacity:1}
+.queue-remove:hover{color:#e06c6c}
+@media(max-width:600px){#queue-drawer{width:100vw}}
+
+/* ── Playlist naming ──────────────────────────────────────────────────────
+   A real dialog in the app's own voice instead of the browser's bare
+   prompt() -- covers every spot a playlist's name gets typed (creating one
+   fresh, or renaming an existing one from the wall or its detail page). ── */
+#pln-scrim{position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:270;opacity:0;pointer-events:none;transition:opacity .2s ease}
+#pln-scrim.open{opacity:1;pointer-events:auto}
+#pln-modal{
+  position:fixed;top:50%;left:50%;z-index:271;width:min(340px,88vw);
+  background:var(--bg2);border:1px solid var(--border);border-radius:10px;
+  padding:1.4rem 1.4rem 1.2rem;box-shadow:0 20px 60px rgba(0,0,0,.5);
+  opacity:0;pointer-events:none;
+  transform:translate(-50%,-50%) scale(.96);
+  transition:opacity .2s ease,transform .2s cubic-bezier(.22,.61,.36,1);
+}
+#pln-modal.open{opacity:1;pointer-events:auto;transform:translate(-50%,-50%) scale(1)}
+#pln-title{font-family:var(--font-serif);font-size:1.15rem;font-weight:700;color:var(--text);margin-bottom:.9rem}
+#pln-input{
+  width:100%;background:var(--bg);border:1px solid var(--border);border-radius:6px;
+  color:var(--text);font-family:var(--font-sans);font-size:.9rem;padding:.6rem .7rem;
+  transition:border-color .15s ease;
+}
+#pln-input:focus{outline:none;border-color:var(--gold)}
+#pln-actions{display:flex;justify-content:flex-end;gap:.7rem;margin-top:1.1rem}
+#pln-cancel{background:none;border:none;color:var(--muted);font-family:var(--font-sans);font-size:.85rem;cursor:pointer;padding:.4rem .3rem}
+#pln-cancel:hover{color:var(--text)}
+#pln-ok{
+  background:var(--gold);color:#0a0a0a;border:none;border-radius:999px;
+  font-family:var(--font-sans);font-size:.85rem;font-weight:600;
+  padding:.45rem 1.2rem;cursor:pointer;transition:opacity .15s ease;
+}
+#pln-ok:hover{opacity:.85}
+#pln-ok:disabled{opacity:.4;cursor:default}
 
 /* Section heading — a wayfinding label, not a heading: small, wide-tracked,
    no divider line, just air above it. */
@@ -5818,6 +6384,11 @@ body.remote .mgmt{display:none!important}
    and are deliberately left alone. */
 #file-grid{display:grid;gap:18px;padding:0 var(--gutter) 2rem;max-width:var(--shell);margin:0 auto;grid-template-columns:repeat(5,1fr)}
 #music-grid{display:none;grid-template-columns:repeat(auto-fill,minmax(215px,1fr));gap:24px 24px;row-gap:28px;padding:0 var(--gutter) 2rem;max-width:var(--shell);margin:0 auto}
+/* Other lives outside #file-grid entirely, as its own last-place shelf below
+   Music Videos -- its own grid, same column shape as #file-grid, so its
+   cards (plain renderFileCard poster tiles) size identically to Films'. */
+#rail-other{padding:0 var(--gutter);max-width:var(--shell);margin:1.9rem auto .1rem}
+#other-grid{display:none;gap:18px;padding:0 var(--gutter) 2rem;max-width:var(--shell);margin:0 auto;grid-template-columns:repeat(5,1fr)}
 
 /* ── Shared card base ─────────────────────────────────────────────────────── */
 .card{cursor:pointer;position:relative;background:none;border:none;border-radius:0;transition:transform .18s}
@@ -5832,7 +6403,7 @@ body.light .card:hover .pc-cover,body.light .card:focus-visible .pc-cover{box-sh
 /* Chrome keeps the gold focus ring — it is brand furniture. Content tiles
    take a neutral one, so gold on the wall only ever means "you have watched
    part of this". */
-.view-btn:focus-visible,.header-btn:focus-visible,#modal-close:focus-visible,#modal-actions button:focus-visible,#modal-quality:focus-visible,.sr-tmdb:focus-visible,.sr-torrent:focus-visible{outline:2px solid var(--gold);outline-offset:2px}
+.view-btn:focus-visible,.header-btn:focus-visible,#topbar-back:focus-visible,.wordmark:focus-visible,#modal-close:focus-visible,#modal-actions button:focus-visible,#modal-quality:focus-visible,.sr-tmdb:focus-visible,.sr-torrent:focus-visible{outline:2px solid var(--gold);outline-offset:2px}
 /* :focus-visible rather than :focus: clicking (or right-clicking) a button
    focuses it in some browsers, which otherwise drew this same outline on
    nothing more than a click -- :focus-visible's own heuristic already knows
@@ -5905,10 +6476,31 @@ body.light .card:hover .pc-cover,body.light .card:focus-visible .pc-cover{box-sh
 body.light .pl-card:hover .pl-cover{box-shadow:0 0 16px 1px rgba(40,30,20,.32)}
 .pl-cover img{width:100%;height:100%;object-fit:cover;display:block}
 .pl-empty{display:flex;align-items:center;justify-content:center;height:100%;color:var(--muted);font-size:1.5rem}
+/* Same red disc as the detail page's own Play all (see .pld-play) -- hidden
+   until the tile is actually hovered or focused, so starting a playlist
+   straight from the wall doesn't need opening it first. */
+.pl-play{
+  position:absolute;bottom:.6rem;right:.6rem;transform:scale(.85);
+  width:2.6rem;height:2.6rem;border-radius:50%;
+  display:flex;align-items:center;justify-content:center;
+  background:var(--play);color:#fff;font-size:.85rem;padding-left:.15rem;
+  box-shadow:0 3px 14px rgba(0,0,0,.4);
+  opacity:0;pointer-events:none;
+  transition:opacity .18s ease,transform .18s cubic-bezier(.22,.61,.36,1),background .18s ease;
+}
+.pl-card:hover .pl-play,.pl-card:focus-visible .pl-play,.pl-card:focus-within .pl-play{
+  opacity:1;pointer-events:auto;transform:scale(1);
+}
+.pl-play:hover{background:var(--play-lit)}
 .pl-meta{padding-top:.5rem}
 .pl-name{font-family:var(--font-sans);font-size:.82rem;color:var(--text);line-height:1.3;
   display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
 .pl-count{font-family:var(--font-mono);font-size:.66rem;color:var(--muted);margin-top:.22rem;letter-spacing:.05em}
+/* Drop feedback while dragging a music video over a playlist tile -- placed
+   after the plain hover glow above so it wins the tie when both apply
+   (dragging over necessarily means hovering too). */
+.pl-card.drop-target .pl-cover{box-shadow:0 0 0 3px var(--gold) inset,0 0 16px 1px rgba(255,255,255,.22)}
+.card.dragging{opacity:.4}
 
 /* ── Right-click menu ──────────────────────────────────────────────────────
    The wall has no room for a per-tile control, and a hover affordance would
@@ -6103,6 +6695,13 @@ body.light .card:hover .mv2-cover img{filter:none}
   .cw-rail{grid-template-columns:repeat(auto-fill,minmax(165px,1fr));gap:12px}
   .rail-head{margin:1.4rem 0 .1rem}
   .rail-head .rh-t{font-size:.92rem}
+  /* The base grid is a fixed 5 columns, sized for desktop -- on a phone
+     that squeezes every poster down regardless of actual screen width.
+     Switching to auto-fill here lets the column count follow the viewport
+     instead of forcing 5 all the way down to 400px. */
+  #file-grid{gap:14px;grid-template-columns:repeat(auto-fill,minmax(140px,1fr))}
+  #other-grid{gap:14px;grid-template-columns:repeat(auto-fill,minmax(140px,1fr))}
+  #music-grid{grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:16px}
   /* Touch has no hover, so an on-demand caption would never appear — the
      overlay becomes permanent rather than the title becoming unreachable. */
   .pc-ovl{opacity:1;background:linear-gradient(to top,rgba(0,0,0,.9) 0%,rgba(0,0,0,.3) 42%,transparent 66%)}
@@ -6118,9 +6717,11 @@ body.light .card:hover .mv2-cover img{filter:none}
   .wordmark span{display:none}
   .header-btn{padding:.28rem .55rem;font-size:.66rem}
   .view-btn{width:26px;height:26px}
-  #topbar-back{font-size:.68rem}
+  #topbar-back{width:26px;height:26px}
+  #topbar-back svg{width:15px;height:15px}
   #file-grid{gap:14px;grid-template-columns:repeat(auto-fill,minmax(130px,1fr))}
   #music-grid{grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:16px}
+  #other-grid{gap:14px;grid-template-columns:repeat(auto-fill,minmax(130px,1fr))}
 
   /* Cinematic detail — backdrop */
   .sv-backdrop{height:220px}
@@ -6188,7 +6789,12 @@ body.light .card:hover .mv2-cover img{filter:none}
 .sv-poster{flex-shrink:0;width:160px;aspect-ratio:2/3;border-radius:4px;object-fit:cover;box-shadow:0 8px 36px rgba(0,0,0,.5)}
 .sv-poster-ph{display:flex;align-items:center;justify-content:center;background:var(--bg2);font-size:2.5rem}
 .sv-info{flex:1;padding-top:var(--detail-top);min-width:0}
-.sv-title{font-family:var(--font-serif);font-size:2.3rem;font-weight:700;color:var(--text);letter-spacing:-.01em;margin:0 0 .55rem;line-height:1.14;text-wrap:balance}
+/* Capped to the same measure the overview and the play button's own x
+   both key off (see .sv-play-btn) -- without it a long title ran the full
+   width of the flex column, straight under the button sitting at that fixed
+   x, instead of wrapping clear of it the way a shorter title always did by
+   virtue of just not reaching that far. */
+.sv-title{font-family:var(--font-serif);font-size:2.3rem;font-weight:700;color:var(--text);letter-spacing:-.01em;margin:0 0 .55rem;line-height:1.14;text-wrap:balance;max-width:var(--detail-measure)}
 .sv-meta{display:flex;align-items:center;gap:.7rem;font-family:var(--font-mono);font-size:.82rem;color:var(--muted);margin-bottom:.6rem}
 .sv-meta-sep{color:var(--border)}
 .sv-rating{color:var(--gold)}
@@ -6224,6 +6830,53 @@ body.light .card:hover .mv2-cover img{filter:none}
 .sv-play-btn:active{transform:scale(1.02)}
 .sv-play-btn:focus-visible{outline:3px solid #fff;outline-offset:3px}
 @media(prefers-reduced-motion:reduce){.sv-play-btn{transition:none}}
+
+/* ── Playlist detail (square cover) — see renderPlaylistView for why this is
+   its own layout rather than the cinematic backdrop the other two use. ── */
+.pld-wrap{grid-column:1/-1;display:flex;gap:32px;align-items:flex-end;margin:1rem 0 2rem}
+.pld-cover-wrap{position:relative;flex-shrink:0;width:220px;height:220px;border-radius:8px;box-shadow:0 8px 36px rgba(0,0,0,.5)}
+.pld-cover{width:220px;height:220px;object-fit:cover;border-radius:8px;background:var(--bg2);display:block}
+.pld-cover-empty{display:flex;align-items:center;justify-content:center;font-size:3rem;color:var(--muted)}
+/* The edit affordance only shows itself on hover/focus, over a dimming
+   scrim, so a playlist's cover reads as art at rest, same as everywhere
+   else art appears in this app -- and stays reachable by keyboard as its
+   own focusable button rather than depending on hovering the image. */
+.pld-cover-edit{
+  position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+  background:rgba(0,0,0,0);color:transparent;border:none;border-radius:8px;cursor:pointer;
+  font-family:var(--font-mono);font-size:.72rem;letter-spacing:.05em;
+  transition:background .18s ease,color .18s ease;
+}
+.pld-cover-wrap:hover .pld-cover-edit,.pld-cover-edit:focus-visible{background:rgba(0,0,0,.55);color:#fff}
+.pld-info{flex:1;min-width:0;padding-bottom:.3rem}
+.pld-kicker{font-family:var(--font-mono);font-size:.72rem;letter-spacing:.18em;text-transform:uppercase;color:var(--muted);margin-bottom:.5rem}
+.pld-name{font-family:var(--font-serif);font-size:2.1rem;font-weight:700;color:var(--text);letter-spacing:-.01em;margin:0 0 .5rem;line-height:1.15;text-wrap:balance;max-width:var(--detail-measure)}
+.pld-meta{font-family:var(--font-mono);font-size:.82rem;color:var(--muted);margin-bottom:1.1rem}
+.pld-actions{display:flex;align-items:center;gap:1.3rem}
+.pld-play{
+  display:flex;align-items:center;gap:.5rem;background:var(--play);color:#fff;border:none;
+  padding:.6rem 1.3rem;border-radius:999px;font-family:var(--font-sans);font-size:.85rem;font-weight:600;
+  cursor:pointer;box-shadow:0 3px 14px rgba(0,0,0,.4);
+  transition:transform .18s cubic-bezier(.22,.61,.36,1),box-shadow .18s ease,background .18s ease;
+}
+.pld-play::before{content:"▶";font-size:.65rem}
+.pld-play:hover{transform:scale(1.03);background:var(--play-lit);box-shadow:0 5px 20px rgba(0,0,0,.48)}
+.pld-play:focus-visible{outline:3px solid #fff;outline-offset:3px}
+.pld-more{
+  display:flex;align-items:center;justify-content:center;flex-shrink:0;
+  width:36px;height:36px;border-radius:50%;
+  background:none;border:1px solid var(--border);color:var(--muted);font-size:1.1rem;cursor:pointer;
+  transition:background-color .15s ease,color .15s ease,border-color .15s ease;
+}
+.pld-more:hover{color:var(--gold);border-color:var(--gold)}
+.pld-more:focus-visible{outline:2px solid var(--gold);outline-offset:2px}
+@media(max-width:600px){
+  .pld-wrap{gap:16px;align-items:center}
+  .pld-cover-wrap,.pld-cover{width:104px;height:104px}
+  .pld-cover-empty{font-size:1.8rem}
+  .pld-name{font-size:1.3rem}
+  .pld-actions{gap:.9rem}
+}
 
 .sv-season-tabs{grid-column:1/-1;display:flex;gap:1.5rem;border-bottom:1px solid var(--border);margin:1.8rem 0 0}
 .sv-season-tab{font-family:var(--font-mono);font-size:.82rem;letter-spacing:.05em;color:var(--muted);padding-bottom:.7rem;border-bottom:1px solid transparent;cursor:pointer}
@@ -6296,23 +6949,32 @@ body.light .card:hover .mv2-cover img{filter:none}
 /* Not flat black: the same wash the wall uses, thrown behind the picture at
    a fraction of its strength. Enough to tell you the room is still the room,
    not enough to compete with what is playing. */
+/* Registered so the colour-mix strength itself can be a keyframe target,
+   the same reason --wash-x/--wash-y are registered above -- there's no
+   element-level opacity available to pulse here the way #tint-wash uses its
+   own (animating #modal's opacity would fade the video right along with
+   it), so the "breathing" has to live inside the gradient's own mix amount
+   instead. */
+@property --wash-mix { syntax: '<percentage>'; inherits: true; initial-value: 45%; }
 #modal{display:none;position:fixed;inset:0;z-index:100;align-items:center;justify-content:center;flex-direction:column;padding:1rem;
   overflow-y:auto;
   background-color:rgba(0,0,0,.94);
   background-repeat:no-repeat;
+  /* Same travelling-glow technique as the minimized player's own now-playing
+     wash (see #tint-wash) -- same --wash-x/--wash-y path, same --tint-playing
+     source so every title still gets its own colour, just live the whole
+     time a video is open rather than gated on a queue, since there's no
+     wall showing through here to reserve the effect for. */
   background-image:
-    radial-gradient(38% 38% at center, color-mix(in srgb, var(--tint, rgb(154,125,74)) 17%, transparent), transparent 72%),
-    radial-gradient(32% 32% at center, color-mix(in srgb, var(--tint, rgb(154,125,74)) 9%, transparent), transparent 74%);
-  background-size:170% 170%,200% 200%;
-  background-position:18% -8%,86% 104%;
-  transition:background-color 420ms cubic-bezier(.4,0,.2,1),background-image 420ms cubic-bezier(.4,0,.2,1);
-  animation:modalTintDrift 24s ease-in-out infinite alternate;
+    radial-gradient(ellipse at var(--wash-x) var(--wash-y),
+      color-mix(in oklch, var(--tint-playing, rgb(154,125,74)) var(--wash-mix), transparent) 0%,
+      color-mix(in oklch, var(--tint-playing, rgb(154,125,74)) var(--wash-mix), transparent) 35%,
+      transparent 78%);
+  transition:background-color 420ms cubic-bezier(.4,0,.2,1);
+  animation:tintWashMove 26s ease-in-out infinite alternate, modalWashMix 16s ease-in-out infinite;
 }
-@keyframes modalTintDrift{
-  0%   {background-position:18% -8%, 86% 104%}
-  100% {background-position:58% 38%, 30% 55%}
-}
-@media(prefers-reduced-motion:reduce){#modal{transition:none;animation:none;background-position:35% 15%,65% 85%}}
+@keyframes modalWashMix{0%,100%{--wash-mix:22%}50%{--wash-mix:32%}}
+@media(prefers-reduced-motion:reduce){#modal{transition:none;animation:none;--wash-x:50%;--wash-y:50%;--wash-mix:26%}}
 
 /* ── Modal chrome ──────────────────────────────────────────────────────────
    While something is playing, the filename, action row and close button are
@@ -6375,8 +7037,12 @@ html.media-paused #modal{animation-play-state:paused}
 .pause-t{font-family:var(--font-serif);font-size:1.7rem;font-weight:700;color:#fff;line-height:1.15;text-wrap:balance}
 .pause-s{font-family:var(--font-sans);font-size:.88rem;color:rgba(255,255,255,.74);margin-top:.35rem}
 /* A 340px corner player has no room for full-size type -- same idea as the
-   narrow-viewport shrink below, just smaller again to match. */
-#modal.mini #pause-card{padding:0 0 .45rem .55rem}
+   narrow-viewport shrink below, just smaller again to match. Centered
+   vertically rather than anchored to the bottom like the full player (there's
+   nothing else nearby competing for that spot in a box this small), and
+   dimmed a touch since there's much less picture for the shadow-only
+   legibility trick above to read against. */
+#modal.mini #pause-card{align-items:center;padding:0 0 0 .55rem;background:rgba(0,0,0,.32);border-radius:8px}
 #modal.mini .pause-in{max-width:92%}
 #modal.mini .pause-kicker{font-size:.5rem;gap:.3rem;margin-bottom:.2rem}
 #modal.mini .pause-kicker::before{width:6px;height:8px;border-width:2px}
@@ -6440,7 +7106,15 @@ html.media-paused #modal{animation-play-state:paused}
 #modal.mini:hover #modal-close,#modal.mini #modal-close:focus-visible,
 #modal.mini:hover #modal-mini-controls button,#modal.mini #modal-mini-controls button:focus-visible{opacity:1}
 #modal.mini #modal-mini-controls button:hover{border-color:var(--gold);color:var(--gold)}
-#modal.mini #modal-mini-controls button:disabled{opacity:.25!important;cursor:default}
+#modal.mini #modal-mini-controls button:disabled{cursor:default}
+/* Disabled (no previous/next) still starts fully invisible like everything
+   else -- the !important this replaced made a disabled button visible at
+   rest regardless of hover, which is what kept Previous/Next from ever
+   fading out with Cancel and Play/Pause on minimizing. It only dims to .25
+   instead of the full opacity:1 once actually revealed, so "there's nothing
+   to skip to" still reads once you're looking at it. */
+#modal.mini:hover #modal-mini-controls button:disabled,
+#modal.mini #modal-mini-controls button:disabled:focus-visible{opacity:.25}
 #modal.mini video{max-width:100%;max-height:100%;border-radius:8px}
 #modal-close{position:absolute;top:1rem;right:1.25rem;background:none;border:none;color:var(--muted);font-size:1.5rem;cursor:pointer;line-height:1}
 #modal-close:hover{color:var(--text)}
@@ -6448,7 +7122,7 @@ html.media-paused #modal{animation-play-state:paused}
 /* Right-clicking the video focuses it in some browsers, which otherwise
    draws the browser's own default focus rectangle (a harsh white/blue box)
    right over the picture for no interaction reason worth marking that hard. */
-#modal video:focus-visible{outline:none;box-shadow:0 0 0 2px color-mix(in srgb, var(--gold) 55%, transparent)}
+#modal video:focus-visible{outline:none;box-shadow:0 0 0 2px color-mix(in oklch, var(--gold) 55%, transparent)}
 #modal-note{max-width:640px;width:100%;background:var(--bg2);border-radius:6px;padding:1.5rem;font-size:.9rem;line-height:1.7;white-space:pre-wrap;word-break:break-word;max-height:70vh;overflow-y:auto}
 /* Floating below the video (position computed in syncTapArea) rather than
    stacked under it in normal flow -- that way #modal centers the video
@@ -6476,8 +7150,8 @@ html.media-paused #modal{animation-play-state:paused}
 <div id="ctx-menu" role="menu"></div>
 <div id="topbar">
 <header>
-  <button id="topbar-back" aria-label="Back to library">← all</button>
-  <span class="wordmark">Stream<span>Videos</span></span>
+  <button id="topbar-back" aria-label="Back to library" tabindex="0"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M15.41 7.41L14 6l-6 6 6 6 1.41-1.41L10.83 12z"/></svg></button>
+  <span class="wordmark" id="wordmark-home" role="button" tabindex="0" aria-label="Home">Stream<span>Videos</span></span>
   <span class="spacer"></span>
   <button class="view-btn" id="btn-view" title="Switch between poster and list view" tabindex="0">⊞</button>
   <button class="header-btn" id="theme-toggle-btn" title="Toggle light/dark theme" tabindex="0">light</button>
@@ -6486,6 +7160,7 @@ html.media-paused #modal{animation-play-state:paused}
 </header>
 </div>
 <nav id="section-tags"></nav>
+<nav id="pl-sidebar"></nav>
 
 <div id="search-overlay">
   <div id="search-box">
@@ -6522,8 +7197,26 @@ html.media-paused #modal{animation-play-state:paused}
 <div id="file-grid"></div>
 <div id="music-heading">Music Videos</div>
 <div id="music-grid"></div>
+<div id="rail-other" class="rail-head" style="display:none"><span class="rh-t"></span><span class="rh-c"></span><span class="rh-l"></span></div>
+<div id="other-grid"></div>
 <div id="file-list"></div>
 <div id="toast"></div>
+
+<div id="queue-scrim"></div>
+<div id="queue-drawer">
+  <div id="queue-head"><span>Up next</span><button id="queue-close" aria-label="Close queue">&times;</button></div>
+  <div id="queue-list"></div>
+</div>
+
+<div id="pln-scrim"></div>
+<div id="pln-modal" role="dialog" aria-modal="true">
+  <div id="pln-title">Name this playlist</div>
+  <input id="pln-input" type="text" maxlength="80" placeholder="My playlist" autocomplete="off">
+  <div id="pln-actions">
+    <button id="pln-cancel">Cancel</button>
+    <button id="pln-ok">Create</button>
+  </div>
+</div>
 
 <div id="modal">
   <button id="modal-close">&times;</button>
@@ -6631,6 +7324,85 @@ function hasActiveQueue() {
   return queueSessionActive || playlistQueue !== null;
 }
 
+// ── Queue drawer ─────────────────────────────────────────────────────────
+// A slide-in panel listing what's actually queued next: the ad-hoc queue
+// first, then whatever remains of a playing playlist behind it -- the same
+// priority order peekNext()/goNext() already use, so what this shows is
+// exactly what pressing Next would do. Reached from the player's right-click
+// menu (see openPlayerCtxMenu) rather than a dedicated button, the same way
+// Minimize/PiP/Fullscreen already live there instead of crowding the mini
+// player's own three icons.
+var queueDrawer = document.getElementById('queue-drawer');
+var queueList = document.getElementById('queue-list');
+var queueScrim = document.getElementById('queue-scrim');
+
+function queueRows() {
+  var rows = upNextQueue.map(function(key) { return {key: key, label: 'Queued', removable: true}; });
+  if (playlistQueue) {
+    for (var i = playlistPos + 1; i < playlistQueue.length; i++) {
+      rows.push({key: playlistQueue[i].key, label: 'Playlist · ' + (i + 1) + ' of ' + playlistQueue.length, removable: false});
+    }
+  }
+  return rows;
+}
+
+function renderQueueDrawer() {
+  if (!queueList) return;
+  var rows = queueRows();
+  queueList.innerHTML = '';
+  if (!rows.length) {
+    queueList.innerHTML = '<div class="queue-empty">Nothing queued yet — right-click any video and choose "Add to queue".</div>';
+    return;
+  }
+  rows.forEach(function(row) {
+    var f = currentFiles.filter(function(x){ return x.key === row.key; })[0];
+    if (!f) return;
+    var art = artFor(f, true);
+    var item = document.createElement('div');
+    item.className = 'queue-row';
+    item.innerHTML =
+      '<div class="queue-shot">' +
+        (art ? '<img src="' + esc(art) + '" loading="lazy" alt="" onerror="this.style.display=\'none\'">'
+             : '<div class="queue-noshot">▶</div>') +
+      '</div>' +
+      '<div class="queue-info">' +
+        '<div class="queue-title">' + esc(mediaTag(f)) + '</div>' +
+        '<div class="queue-sub">' + esc(row.label) + '</div>' +
+      '</div>' +
+      (row.removable ? '<button class="queue-remove" aria-label="Remove from queue">✕</button>' : '');
+    item.addEventListener('click', function(e){
+      if (e.target.closest('.queue-remove')) return;
+      closeQueueDrawer();
+      openFile(null, row.key, false, true);
+    });
+    if (row.removable) {
+      item.querySelector('.queue-remove').addEventListener('click', function(e){
+        e.stopPropagation();
+        var idx = upNextQueue.indexOf(row.key);
+        if (idx !== -1) upNextQueue.splice(idx, 1);
+        if (!upNextQueue.length && !playlistQueue) queueSessionActive = false;
+        syncMiniControls();
+        updateNowPlayingWash();
+        renderQueueDrawer();
+      });
+    }
+    queueList.appendChild(item);
+  });
+}
+
+function openQueueDrawer() {
+  renderQueueDrawer();
+  if (queueDrawer) queueDrawer.classList.add('open');
+  if (queueScrim) queueScrim.classList.add('open');
+}
+function closeQueueDrawer() {
+  if (queueDrawer) queueDrawer.classList.remove('open');
+  if (queueScrim) queueScrim.classList.remove('open');
+}
+var queueCloseBtn = document.getElementById('queue-close');
+if (queueCloseBtn) queueCloseBtn.addEventListener('click', closeQueueDrawer);
+if (queueScrim) queueScrim.addEventListener('click', closeQueueDrawer);
+
 // nowPlayingTint/setNowPlayingTint: the currently-playing track's own
 // colour, tracked independently of --tint (which a hovered wall card keeps
 // overriding, then settles back to the wall's hero colour on mouseleave —
@@ -6677,6 +7449,8 @@ var msg        = document.getElementById('msg');
 var fileGrid   = document.getElementById('file-grid');
 var musicGrid  = document.getElementById('music-grid');
 var musicHeading = document.getElementById('music-heading');
+var otherGrid = document.getElementById('other-grid');
+var otherHeadEl = document.getElementById('rail-other');
 var fileList   = document.getElementById('file-list');
 var topbarBack = document.getElementById('topbar-back');
 // One button for all three detail pages -- whichever is open decides where
@@ -6688,6 +7462,24 @@ function backFromDetail() {
   if (currentPlaylist) { closePlaylist(); return; }
 }
 if (topbarBack) topbarBack.addEventListener('click', backFromDetail);
+
+// Clicking the logo is the universal "take me home" affordance every site
+// has -- previously this span did nothing at all. Reuses backToHome's own
+// history-based unwind (the same one the back button and a show/movie/
+// playlist's own close already go through) rather than resetting state
+// directly, so it can never drift out of sync with what "back" already
+// does, and never touches a minimized player underneath.
+function goHome() {
+  if (currentShow || currentMovieDetail || currentPlaylist) { backToHome(); return; }
+  window.scrollTo({top: 0, behavior: 'smooth'});
+}
+var wordmarkHome = document.getElementById('wordmark-home');
+if (wordmarkHome) {
+  wordmarkHome.addEventListener('click', goHome);
+  wordmarkHome.addEventListener('keydown', function(e){
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); goHome(); }
+  });
+}
 var modal      = document.getElementById('modal');
 var modalVideo = document.getElementById('modal-video');
 var modalNote  = document.getElementById('modal-note');
@@ -6788,7 +7580,11 @@ function playlistItems(pl) {
   if (!pl) return [];
   var byKey = {};
   currentFiles.forEach(function(f){ byKey[f.key] = f; });
-  return pl.items.map(function(k){ return byKey[k]; }).filter(Boolean);
+  // items is normalised server-side now, but defensively covers any
+  // playlist saved by an older build before that fix (see loadPlaylists in
+  // main.go) -- a null here used to throw and take the rest of the wall's
+  // render down with it.
+  return (pl.items || []).map(function(k){ return byKey[k]; }).filter(Boolean);
 }
 
 function playlistAction(body) {
@@ -6798,6 +7594,50 @@ function playlistAction(body) {
     body: JSON.stringify(body)
   }).then(function(r){ return r.ok ? r.json() : Promise.reject(r.status); });
 }
+
+// ── Playlist naming dialog ──────────────────────────────────────────────────
+// One dialog for both creating and renaming, since they're the same question
+// ("what should this playlist be called") asked at two different moments --
+// resolves with the trimmed name, or null if cancelled, so every call site
+// reads the same way a prompt() call already did.
+var plnScrim = document.getElementById('pln-scrim');
+var plnModal = document.getElementById('pln-modal');
+var plnTitleEl = document.getElementById('pln-title');
+var plnInput = document.getElementById('pln-input');
+var plnOk = document.getElementById('pln-ok');
+var plnCancel = document.getElementById('pln-cancel');
+var plnResolve = null;
+
+function askPlaylistName(title, defaultValue, okLabel) {
+  return new Promise(function(resolve){
+    plnResolve = resolve;
+    plnTitleEl.textContent = title;
+    plnOk.textContent = okLabel || 'Create';
+    plnInput.value = defaultValue || '';
+    plnOk.disabled = !plnInput.value.trim();
+    plnScrim.classList.add('open');
+    plnModal.classList.add('open');
+    setTimeout(function(){ plnInput.focus(); plnInput.select(); }, 60);
+  });
+}
+function closePlaylistNameDialog(result) {
+  plnScrim.classList.remove('open');
+  plnModal.classList.remove('open');
+  if (plnResolve) { var r = plnResolve; plnResolve = null; r(result); }
+}
+if (plnInput) {
+  plnInput.addEventListener('input', function(){ plnOk.disabled = !plnInput.value.trim(); });
+  plnInput.addEventListener('keydown', function(e){
+    if (e.key === 'Enter' && !plnOk.disabled) { e.preventDefault(); plnOk.click(); }
+    if (e.key === 'Escape') { e.preventDefault(); closePlaylistNameDialog(null); }
+  });
+}
+if (plnOk) plnOk.addEventListener('click', function(){
+  var v = plnInput.value.trim();
+  if (v) closePlaylistNameDialog(v);
+});
+if (plnCancel) plnCancel.addEventListener('click', function(){ closePlaylistNameDialog(null); });
+if (plnScrim) plnScrim.addEventListener('click', function(){ closePlaylistNameDialog(null); });
 
 // ── Right-click menu ───────────────────────────────────────────────────────
 var ctxMenu = document.getElementById('ctx-menu');
@@ -6828,10 +7668,11 @@ function openCtxMenu(e, f) {
   rows.push('<div class="ctx-sep"></div>');
   rows.push('<div class="ctx-head">Add to playlist</div>');
   playlists.forEach(function(pl){
-    var has = pl.items.indexOf(f.key) !== -1;
+    var items = pl.items || [];
+    var has = items.indexOf(f.key) !== -1;
     rows.push('<button class="ctx-item" data-act="add" data-id="' + esc(pl.id) + '"' +
       (has ? ' disabled style="opacity:.45"' : '') + '>' +
-      '<span>' + esc(pl.name) + '</span><span class="n">' + (has ? 'added' : pl.items.length) + '</span></button>');
+      '<span>' + esc(pl.name) + '</span><span class="n">' + (has ? 'added' : items.length) + '</span></button>');
   });
   rows.push('<button class="ctx-item ctx-new" data-act="new">+ New playlist\u2026</button>');
   ctxMenu.innerHTML = rows.join('');
@@ -6878,13 +7719,14 @@ function openCtxMenu(e, f) {
         return;
       }
       if (act === 'new') {
-        var name = prompt('Name this playlist');
-        if (name === null) return;
-        playlistAction({action:'create', name:name, key:f.key}).then(function(){
-          return loadPlaylists();
-        }).then(function(){
-          showToast('Playlist created');
-          renderGrid(currentFiles);
+        askPlaylistName('New playlist', '', 'Create').then(function(name){
+          if (!name) return;
+          playlistAction({action:'create', name:name, key:f.key}).then(function(){
+            return loadPlaylists();
+          }).then(function(){
+            showToast('Playlist created');
+            renderGrid(currentFiles);
+          });
         });
       }
     });
@@ -6941,8 +7783,22 @@ function progressOf(f) {
 // server already evicts anything finished or barely started, so whatever is
 // in the map is genuinely resumable.
 function continueItems(files) {
-  return files.filter(progressOf).sort(function(a,b){
+  var sorted = files.filter(progressOf).sort(function(a,b){
     return (progressMap[b.key].updated||0) - (progressMap[a.key].updated||0);
+  });
+  // Music videos are capped at 4 anywhere in the row -- without this, a
+  // binge of them could crowd out every slot, leaving no room for the shows
+  // and movies the row exists to surface progress on. Applied here, before
+  // the row's own 8-item limit at the call site, so a movie or episode
+  // sitting just past a 5th music video gets pulled up into contention
+  // rather than losing its spot to it; recency order otherwise stays
+  // untouched, so the 4 that remain can land anywhere, interleaved with
+  // everything else, not bunched at the front or back.
+  var musicSeen = 0;
+  return sorted.filter(function(f){
+    if (!f.is_music_video) return true;
+    musicSeen++;
+    return musicSeen <= 4;
   });
 }
 
@@ -7369,10 +8225,22 @@ function renderShowCard(show) {
 
 var currentSeason = null;
 
+// Stamps the entry being left with where the wall was scrolled to, so
+// popstate's own 'home' branch can put it back exactly there instead of
+// resetting to the top -- captured on the entry that's about to stop being
+// current, since that's the one a later "back" actually returns to.
+function pushDetailState(state, hash) {
+  var cur = history.state || {};
+  var withScroll = {scrollY: window.scrollY};
+  for (var k in cur) { if (cur.hasOwnProperty(k)) withScroll[k] = cur[k]; }
+  history.replaceState(withScroll, '', location.pathname + location.search + location.hash);
+  history.pushState(state, '', hash);
+}
+
 function openShow(show) {
   currentShow = show;
   currentSeason = null;
-  history.pushState({type:'show', id: show.id}, '', '#show=' + show.id);
+  pushDetailState({type:'show', id: show.id}, '#show=' + show.id);
   window.scrollTo(0, 0);
   renderGrid(currentFiles);
 }
@@ -7388,6 +8256,17 @@ function openShow(show) {
 // underneath is still never touched by any of this either way.
 function backToHome() {
   var skip = (modalInHistory && modal.classList.contains('open') && modal.classList.contains('mini')) ? 2 : 1;
+  // A skip of 2 consumes the mini player's own history entry right along
+  // with the detail page's, without ever going through closeModal's usual
+  // bookkeeping for that (the mini player itself is untouched -- still open
+  // and playing). Without this, the app keeps believing that entry still
+  // exists, so a *later* back press from wherever the user goes next would
+  // skip one too many, overshooting past home into whatever came before this
+  // app in the tab's own history -- a real navigation, which is what was
+  // actually behind "back sometimes refreshes the page and drops the
+  // minimized video": it isn't a refresh so much as leaving the app's own
+  // history entirely and landing on a real, differently-loaded page.
+  if (skip === 2) modalInHistory = false;
   history.go(-skip);
 }
 
@@ -7702,8 +8581,6 @@ function ensureWallSkeleton() {
     filmsGrid: contentsGrid('wall-films-grid'),
     seriesHead: railHeadEl('rail-series'),
     seriesGrid: contentsGrid('wall-series-grid'),
-    otherHead: railHeadEl('rail-other'),
-    otherGrid: contentsGrid('wall-other-grid'),
     plHead: railHeadEl('rail-playlists'),
     plRail: (function(){ var r = document.createElement('div'); r.className = 'cw-rail'; return r; })(),
     empty: document.createElement('div')
@@ -7713,8 +8590,7 @@ function ensureWallSkeleton() {
   wallEls.empty.style.cssText = 'display:none;color:var(--muted);font-size:.8rem;grid-column:1/-1;padding:2rem 0';
   wallEls.empty.textContent = 'no files yet';
   [wallEls.hero, wallEls.cwHead, wallEls.cwRail, wallEls.filmsHead, wallEls.filmsGrid,
-   wallEls.seriesHead, wallEls.seriesGrid, wallEls.otherHead, wallEls.otherGrid,
-   wallEls.plHead, wallEls.plRail, wallEls.empty
+   wallEls.seriesHead, wallEls.seriesGrid, wallEls.plHead, wallEls.plRail, wallEls.empty
   ].forEach(function(el){ fileGrid.appendChild(el); });
   wallSkeletonMounted = true;
 }
@@ -7729,31 +8605,35 @@ function setRailHead(h, text, count) {
 
 function renderGrid(files) {
   updateNowPlayingWash(); // home wall vs. a detail page -- see updateNowPlayingWash
-  if (topbarBack) topbarBack.style.display = (currentShow || currentMovieDetail || currentPlaylist) ? 'inline-block' : 'none';
+  if (topbarBack) topbarBack.style.display = (currentShow || currentMovieDetail || currentPlaylist) ? 'flex' : 'none';
+  syncPlSidebarVisibility();
   // A detail page is one title, not a shelf, so the section list has nothing
   // to point at and is cleared rather than left showing the previous view's.
   // Unlike the wall below, these always do a full rebuild -- landing on a
   // title's own page is a real navigation, not a background poll repainting
   // data you're already looking at.
   if (currentShow) {
-    fileGrid.innerHTML = ''; musicGrid.innerHTML = '';
+    fileGrid.innerHTML = ''; musicGrid.innerHTML = ''; otherGrid.innerHTML = '';
     musicHeading.style.display = 'none'; musicGrid.style.display = 'none';
+    otherHeadEl.style.display = 'none'; otherGrid.style.display = 'none';
     wallSkeletonMounted = false;
     clearSectionTags();
     renderShowView(currentShow);
     return;
   }
   if (currentMovieDetail) {
-    fileGrid.innerHTML = ''; musicGrid.innerHTML = '';
+    fileGrid.innerHTML = ''; musicGrid.innerHTML = ''; otherGrid.innerHTML = '';
     musicHeading.style.display = 'none'; musicGrid.style.display = 'none';
+    otherHeadEl.style.display = 'none'; otherGrid.style.display = 'none';
     wallSkeletonMounted = false;
     clearSectionTags();
     renderMovieView(currentMovieDetail.main, currentMovieDetail.extras);
     return;
   }
   if (currentPlaylist) {
-    fileGrid.innerHTML = ''; musicGrid.innerHTML = '';
+    fileGrid.innerHTML = ''; musicGrid.innerHTML = ''; otherGrid.innerHTML = '';
     musicHeading.style.display = 'none'; musicGrid.style.display = 'none';
+    otherHeadEl.style.display = 'none'; otherGrid.style.display = 'none';
     wallSkeletonMounted = false;
     clearSectionTags();
     renderPlaylistView(currentPlaylist);
@@ -7770,9 +8650,9 @@ function renderGrid(files) {
     wallEls.cwRail.innerHTML = ''; wallEls.cwRail.style.display = 'none'; setRailHead(wallEls.cwHead, '', 0);
     wallEls.filmsGrid.innerHTML = ''; setRailHead(wallEls.filmsHead, '', 0);
     wallEls.seriesGrid.innerHTML = ''; setRailHead(wallEls.seriesHead, '', 0);
-    wallEls.otherGrid.innerHTML = ''; setRailHead(wallEls.otherHead, '', 0);
     wallEls.plRail.innerHTML = ''; wallEls.plRail.style.display = 'none'; setRailHead(wallEls.plHead, '', 0);
     musicGrid.innerHTML = ''; musicHeading.style.display = 'none'; musicGrid.style.display = 'none';
+    otherGrid.innerHTML = ''; otherGrid.style.display = 'none'; setRailHead(otherHeadEl, '', 0);
     wallEls.empty.style.display = 'block';
     railAnchors = [];
     buildSectionTags();
@@ -7819,9 +8699,9 @@ function renderGrid(files) {
       return JSON.stringify(show) + '|' + JSON.stringify(inProg ? progressOf(inProg) : null);
     });
 
-  setRailHead(wallEls.otherHead, 'Other', other.length);
-  reconcileKeyed(wallEls.otherGrid, other, function(f){ return f.key; }, renderFileCard, fileSig);
-
+  // Creating one lives in the playlist sidebar now (see renderPlSidebar), so
+  // this rail goes back to hiding like every other section does with
+  // nothing in it, rather than showing an empty header for its own sake.
   setRailHead(wallEls.plHead, 'Playlists', playlists.length);
   wallEls.plRail.style.display = playlists.length ? '' : 'none';
   reconcileKeyed(wallEls.plRail, playlists, function(pl){ return pl.id; }, renderPlaylistCard,
@@ -7837,14 +8717,24 @@ function renderGrid(files) {
   reconcileKeyed(musicGrid, musicItems, function(f){ return f.key; }, renderMusicCard,
     function(f){ return JSON.stringify(f); });
 
+  // Other lives outside #file-grid entirely now (see its own CSS), so it can
+  // sit after Music Videos on the page -- last among the wall's sections,
+  // the way its role as the catch-all for whatever TMDB couldn't place
+  // anywhere more specific actually calls for.
+  setRailHead(otherHeadEl, 'Other', other.length);
+  otherGrid.style.display = other.length ? 'grid' : 'none';
+  reconcileKeyed(otherGrid, other, function(f){ return f.key; }, renderFileCard, fileSig);
+
   railAnchors = [];
   if (cont.length) railAnchors.push({id: 'rail-continue-watching', label: 'Continue watching', count: cont.length});
   if (films.length) railAnchors.push({id: 'rail-films', label: 'Films', count: films.length});
   if (shows.length) railAnchors.push({id: 'rail-series', label: 'Series', count: shows.length});
-  if (other.length) railAnchors.push({id: 'rail-other', label: 'Other', count: other.length});
-  if (playlists.length) railAnchors.push({id: 'rail-playlists', label: 'Playlists', count: playlists.length});
+  railAnchors.push({id: 'rail-playlists', label: 'Playlists', count: playlists.length});
   if (musicItems.length) railAnchors.push({id: 'music-heading', label: 'Music videos', count: musicItems.length});
+  if (other.length) railAnchors.push({id: 'rail-other', label: 'Other', count: other.length});
   buildSectionTags();
+  renderPlSidebar();
+  syncPlSidebarVisibility();
 }
 
 var tileSeq = 0;
@@ -7910,8 +8800,75 @@ var tagScrollTick = false;
 window.addEventListener('scroll', function(){
   if (tagScrollTick) return;
   tagScrollTick = true;
-  requestAnimationFrame(function(){ markActiveTag(); tagScrollTick = false; });
+  requestAnimationFrame(function(){ markActiveTag(); syncPlSidebarVisibility(); tagScrollTick = false; });
 }, {passive: true});
+
+// ── Playlist sidebar ─────────────────────────────────────────────────────
+// Lives in the same left margin #section-tags claims on the right (see its
+// own CSS), but only while the music section is actually in view -- this has
+// nothing useful to say anywhere else on the wall, and showing it the whole
+// time would just be a permanently-empty promise for a page that has no
+// music videos at all. Doubles as a set of drop targets for dragging a music
+// card straight into a playlist without scrolling back up to the Playlists
+// rail.
+function renderPlSidebar() {
+  var nav = document.getElementById('pl-sidebar');
+  if (!nav) return;
+  var rows = playlists.map(function(pl){
+    return '<button class="pls-item" data-id="' + esc(pl.id) + '" title="' + esc(pl.name) + '">' +
+      '<span class="pls-dot"></span><span class="pls-name">' + esc(pl.name) + '</span>' +
+      '<span class="pls-n">' + (pl.items || []).length + '</span></button>';
+  }).join('');
+  nav.innerHTML =
+    (playlists.length ? rows : '<div class="pls-empty">No playlists yet</div>') +
+    '<button class="pls-item pls-create" data-act="create">+ New playlist</button>';
+
+  Array.prototype.forEach.call(nav.querySelectorAll('.pls-item[data-id]'), function(b){
+    var pl = playlists.filter(function(x){ return x.id === b.dataset.id; })[0];
+    if (!pl) return;
+    b.addEventListener('click', function(){ openPlaylist(pl); });
+    wirePlaylistDropTarget(b, function(key){
+      playlistAction({action:'add', id:pl.id, key:key}).then(function(){
+        return loadPlaylists();
+      }).then(function(){
+        showToast('Added to ' + pl.name);
+        renderGrid(currentFiles);
+      });
+    });
+  });
+  var createBtn = nav.querySelector('[data-act="create"]');
+  var doCreate = function(key) {
+    askPlaylistName('New playlist', '', 'Create').then(function(name){
+      if (!name) return;
+      playlistAction({action:'create', name:name, key:key || undefined}).then(loadPlaylists).then(function(){
+        showToast('Playlist created');
+        renderGrid(currentFiles);
+      });
+    });
+  };
+  createBtn.addEventListener('click', function(){ doCreate(null); });
+  wirePlaylistDropTarget(createBtn, doCreate);
+}
+
+// In view means "the music grid overlaps the visible page below the topbar"
+// -- a plain bounding-box check against the same element the wall already
+// renders, no separate observer to keep in sync with it.
+function syncPlSidebarVisibility() {
+  var nav = document.getElementById('pl-sidebar');
+  if (!nav) return;
+  // List view has no #music-grid rail to key off -- the sidebar's whole
+  // premise is "you've scrolled to that section of the wall", which list
+  // view doesn't have a version of.
+  if (currentShow || currentMovieDetail || currentPlaylist ||
+      viewMode === 'list' || musicHeading.style.display === 'none') {
+    nav.classList.remove('visible');
+    return;
+  }
+  var r = musicGrid.getBoundingClientRect();
+  var bar = document.getElementById('topbar');
+  var top = bar ? bar.offsetHeight : 60;
+  nav.classList.toggle('visible', r.top < window.innerHeight && r.bottom > top);
+}
 
 // pickHeroFilm is the fallback when nothing has been watched yet: a film with
 // a backdrop, chosen at random so the shelf looks different between visits.
@@ -8063,12 +9020,44 @@ function mediaTag(f) {
   return title;
 }
 
+// A dragged card's cover <img> is natively draggable on its own regardless
+// of the outer card's draggable=true, and the browser's default action for
+// dropping a dragged image ANYWHERE that doesn't call preventDefault -- the
+// entire rest of the page, outside the specific tiles wired below -- is to
+// navigate the whole page to that image's URL. That's a real navigation,
+// not an SPA route change, so it wiped every in-memory JS variable
+// (including the queue) and looked exactly like a random page reload.
+// Swallowing dragover/drop globally is the standard fix.
+window.addEventListener('dragover', function(e){ e.preventDefault(); });
+window.addEventListener('drop', function(e){ e.preventDefault(); });
+
+// Shared by every drop target a playlist can be dragged onto -- the wall's
+// own .pl-card tiles, the create tile (name it, seed it with the drop), and
+// the sidebar that appears alongside the music section (see
+// renderPlSidebar). onDrop gets the dragged file's key; el's own
+// .drop-target class is this function's job, not the caller's.
+function wirePlaylistDropTarget(el, onDrop) {
+  el.addEventListener('dragover', function(e){
+    if (Array.prototype.indexOf.call(e.dataTransfer.types, 'text/plain') === -1) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'copy';
+    el.classList.add('drop-target');
+  });
+  el.addEventListener('dragleave', function(){ el.classList.remove('drop-target'); });
+  el.addEventListener('drop', function(e){
+    e.preventDefault();
+    el.classList.remove('drop-target');
+    var key = e.dataTransfer.getData('text/plain');
+    if (key) onDrop(key);
+  });
+}
+
 function renderPlaylistCard(pl) {
   var card = document.createElement('button');
   card.className = 'pl-card';
   card.tabIndex = 0;
   stagger(card);
-  var n = pl.items.length;
+  var n = (pl.items || []).length;
   // The cover is regenerated server-side from current membership, so it is
   // busted on the playlist's updated stamp rather than cached forever.
   var cover = '/playlists/cover?id=' + encodeURIComponent(pl.id) + '&v=' + (pl.updated || 0);
@@ -8076,23 +9065,43 @@ function renderPlaylistCard(pl) {
     '<div class="pl-cover">' +
       (n ? '<img src="' + esc(cover) + '" loading="lazy" alt="" onerror="plNoCover(this)">'
          : '<div class="pl-empty">\u266a</div>') +
+      (n ? '<div class="pl-play" role="button" tabindex="0" aria-label="Play ' + esc(pl.name) + '">\u25b6</div>' : '') +
     '</div>' +
     '<div class="pl-meta"><div class="pl-name">' + esc(pl.name) + '</div>' +
     '<div class="pl-count">' + n + (n === 1 ? ' item' : ' items') + '</div></div>';
   card.addEventListener('click', function(){ openPlaylist(pl); });
   card.addEventListener('contextmenu', function(e){ openPlaylistCtx(e, pl); });
+  var playBtn = card.querySelector('.pl-play');
+  if (playBtn) {
+    var startPlay = function(e){ e.stopPropagation(); playPlaylistFrom(pl, 0); };
+    playBtn.addEventListener('click', startPlay);
+    playBtn.addEventListener('keydown', function(e){
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); startPlay(e); }
+    });
+  }
+  wirePlaylistDropTarget(card, function(key){
+    playlistAction({action:'add', id:pl.id, key:key}).then(function(){
+      return loadPlaylists();
+    }).then(function(){
+      showToast('Added to ' + pl.name);
+      renderGrid(currentFiles);
+    });
+  });
   return card;
 }
 
 function plNoCover(img) {
   img.outerHTML = '<div class="pl-empty">\u266a</div>';
 }
+function pldNoCover(img) {
+  img.outerHTML = '<div class="pld-cover pld-cover-empty">\u266a</div>';
+}
 
 function openPlaylist(pl) {
   currentPlaylist = pl;
   currentShow = null;
   currentMovieDetail = null;
-  history.pushState({type:'playlist', id: pl.id}, '', '#playlist=' + pl.id);
+  pushDetailState({type:'playlist', id: pl.id}, '#playlist=' + pl.id);
   window.scrollTo(0, 0);
   renderGrid(currentFiles);
 }
@@ -8128,10 +9137,11 @@ function openPlaylistCtx(e, pl) {
       if (act === 'play') { playPlaylistFrom(pl, 0); return; }
       if (act === 'cover') { pickPlaylistCover(pl); return; }
       if (act === 'rename') {
-        var name = prompt('Rename playlist', pl.name);
-        if (!name) return;
-        playlistAction({action:'rename', id:pl.id, name:name})
-          .then(loadPlaylists).then(function(){ renderGrid(currentFiles); });
+        askPlaylistName('Rename playlist', pl.name, 'Save').then(function(name){
+          if (!name) return;
+          playlistAction({action:'rename', id:pl.id, name:name})
+            .then(loadPlaylists).then(function(){ renderGrid(currentFiles); });
+        });
         return;
       }
       if (act === 'delete') {
@@ -8166,6 +9176,57 @@ function pickPlaylistCover(pl) {
   inp.click();
 }
 
+// A three-dot menu on the playlist's own detail page -- distinct from
+// openPlaylistCtx's fuller wall-card menu (which also needs "Open" and "Set
+// cover image", already handled inline here by the cover art's own always-
+// visible edit affordance) because from inside the playlist those two don't
+// apply, leaving just the three actions that do.
+function openPlaylistDetailMenu(e, pl) {
+  e.preventDefault();
+  e.stopPropagation();
+  if (!ctxMenu) return;
+  ctxMenu.innerHTML =
+    '<button class="ctx-item" data-act="queue-add">Add to queue</button>' +
+    '<button class="ctx-item" data-act="edit">Edit details…</button>' +
+    '<div class="ctx-sep"></div>' +
+    '<button class="ctx-item" data-act="delete" style="color:#e06c6c">Delete playlist</button>';
+  ctxMenu.classList.add('open');
+  var r = ctxMenu.getBoundingClientRect();
+  ctxMenu.style.left = Math.max(8, Math.min(e.clientX, window.innerWidth - r.width - 8)) + 'px';
+  ctxMenu.style.top = Math.max(8, Math.min(e.clientY, window.innerHeight - r.height - 8)) + 'px';
+
+  Array.prototype.forEach.call(ctxMenu.querySelectorAll('.ctx-item'), function(b){
+    b.addEventListener('click', function(){
+      var act = b.dataset.act;
+      closeCtxMenu();
+      if (act === 'queue-add') {
+        var items = playlistItems(pl);
+        if (!items.length) { showToast('That playlist is empty'); return; }
+        items.forEach(function(f){ queueAdd(f.key, false); });
+        showToast('Added ' + items.length + (items.length === 1 ? ' item' : ' items') + ' to queue');
+        return;
+      }
+      if (act === 'edit') {
+        askPlaylistName('Rename playlist', pl.name, 'Save').then(function(name){
+          if (!name) return;
+          playlistAction({action:'rename', id:pl.id, name:name}).then(loadPlaylists).then(function(){
+            currentPlaylist = playlists.filter(function(x){ return x.id === pl.id; })[0] || currentPlaylist;
+            renderGrid(currentFiles);
+          });
+        });
+        return;
+      }
+      if (act === 'delete') {
+        if (!confirm('Delete the playlist "' + pl.name + '"? The videos stay in the library.')) return;
+        playlistAction({action:'delete', id:pl.id}).then(loadPlaylists).then(function(){
+          if (currentPlaylist && currentPlaylist.id === pl.id) currentPlaylist = null;
+          renderGrid(currentFiles);
+        });
+      }
+    });
+  });
+}
+
 // ── Playlist playback ──────────────────────────────────────────────────────
 // While a playlist is playing, it — not the show an episode belongs to —
 // decides what comes next.
@@ -8187,28 +9248,41 @@ function playlistNext() {
   return true;
 }
 
+// A playlist has no single star image the way a film or a show does -- just
+// whatever cover you picked (or the server's own composite) and a mixed bag
+// of items underneath. The cinematic full-bleed backdrop the other two
+// detail pages use assumes one hero image; here it just meant an image
+// crop of a composite grid stretched across the whole page. A square cover
+// shown at its own size, beside the name and actions, is the layout every
+// real playlist product (Spotify, Apple Music, YouTube Music) converges on
+// for exactly this kind of collection.
 function renderPlaylistView(pl) {
   var items = playlistItems(pl);
   var wrap = document.createElement('div');
-  wrap.className = 'sv-wrap';
+  wrap.className = 'pld-wrap';
   var cover = '/playlists/cover?id=' + encodeURIComponent(pl.id) + '&v=' + (pl.updated || 0);
   wrap.innerHTML =
-    '<div class="sv-backdrop">' +
-      (items.length ? '<img src="' + esc(cover) + '" alt="">' : '') +
-      '<div class="sv-backdrop-fade"></div>' +
+    '<div class="pld-cover-wrap">' +
+      (items.length
+        ? '<img class="pld-cover" src="' + esc(cover) + '" alt="" onerror="pldNoCover(this)">'
+        : '<div class="pld-cover pld-cover-empty">♪</div>') +
+      '<button class="pld-cover-edit" aria-label="Change cover image">Change cover</button>' +
     '</div>' +
-    '<div class="sv-hero">' +
-      '<div class="sv-hero-top">' +
-        '<div class="sv-info">' +
-          '<h2 class="sv-title">' + esc(pl.name) + '</h2>' +
-          '<div class="sv-meta"><span>' + items.length +
-            (items.length === 1 ? ' item' : ' items') + '</span></div>' +
-        '</div>' +
+    '<div class="pld-info">' +
+      '<div class="pld-kicker">Playlist</div>' +
+      '<h2 class="pld-name">' + esc(pl.name) + '</h2>' +
+      '<div class="pld-meta">' + items.length + (items.length === 1 ? ' item' : ' items') + '</div>' +
+      '<div class="pld-actions">' +
+        (items.length ? '<button class="pld-play">Play all</button>' : '') +
+        '<button class="pld-more" aria-label="Playlist options">⋯</button>' +
       '</div>' +
-      (items.length ? '<button class="sv-play-btn" aria-label="Play all" ' +
-        'onclick="playPlaylistFrom(currentPlaylist,0)"></button>' : '') +
     '</div>';
   fileGrid.appendChild(wrap);
+
+  wrap.querySelector('.pld-cover-edit').addEventListener('click', function(){ pickPlaylistCover(pl); });
+  var playAllBtn = wrap.querySelector('.pld-play');
+  if (playAllBtn) playAllBtn.addEventListener('click', function(){ playPlaylistFrom(pl, 0); });
+  wrap.querySelector('.pld-more').addEventListener('click', function(e){ openPlaylistDetailMenu(e, pl); });
 
   if (!items.length) {
     var empty = document.createElement('div');
@@ -8226,17 +9300,18 @@ function renderPlaylistView(pl) {
     row.addEventListener('click', function(){ playPlaylistFrom(pl, i); });
     row.addEventListener('contextmenu', function(e){ openCtxMenu(e, f); });
     var art = artFor(f, true);
-    var pr = progressOf(f);
     var sub = f.media_type === 'tv' && f.season && f.episode
       ? 'S' + pad2(f.season) + 'E' + pad2(f.episode) + (f.episode_title ? '  \u00b7  ' + f.episode_title : '')
       : (f.artist ? f.artist : (f.year ? String(f.year) : ''));
+    // No progress bar here -- a playlist is a sequence you build and replay
+    // on your own terms, not a queue of things to finish, so "how far into
+    // this one am I" doesn't carry the same meaning it does on the wall or a
+    // show's own episode list.
     row.innerHTML =
       '<div class="sv-ep-num">' + (i + 1) + '</div>' +
       '<div class="sv-ep-shot">' +
         (art ? '<img src="' + esc(art) + '" loading="lazy" alt="" crossorigin="anonymous" onerror="epNoStill(this)">'
              : '<div class="sv-ep-no-still">\u25b6</div>') +
-        (pr ? '<div class="sv-ep-prog"><i style="width:' +
-              Math.max(2, Math.min(100, (pr.position / pr.duration) * 100)).toFixed(1) + '%"></i></div>' : '') +
       '</div>' +
       '<div class="sv-ep-info"><div class="sv-ep-head">' +
         '<span class="sv-ep-name">' + esc(f.title || f.name) + '</span>' +
@@ -8268,7 +9343,7 @@ function renderMusicCard(f) {
   stagger(card);
   // A still pulled from the video itself, not the song's album art — that
   // way it always reflects what's actually playing, and shows up even for
-  // a music video iTunes never managed to identify.
+  // a music video whose filename didn't parse into an artist/title.
   var thumbUrl = '/local/thumbnail?path=' + encodeURIComponent(f.key);
   var stillId = !f.title && !f.artist;
   var titleText = stillId ? '⟳ identifying…' : (f.title || f.name);
@@ -8281,6 +9356,18 @@ function renderMusicCard(f) {
   // the wall was the one card type that never threw any colour at all.
   bindTint(card, thumbUrl);
   wireCardMore(card, f);
+  // Drag straight into a playlist -- the sidebar that appears alongside this
+  // section (see renderPlSidebar) and the Playlists rail's own tiles are
+  // both wired as drop targets for exactly this. Mouse/trackpad only; HTML5
+  // drag-and-drop has no touch equivalent, so touch stays on the existing
+  // right-click "Add to playlist" menu.
+  card.draggable = true;
+  card.addEventListener('dragstart', function(e){
+    e.dataTransfer.setData('text/plain', f.key);
+    e.dataTransfer.effectAllowed = 'copy';
+    card.classList.add('dragging');
+  });
+  card.addEventListener('dragend', function(){ card.classList.remove('dragging'); });
   return card;
 }
 
@@ -8404,7 +9491,7 @@ function openFile(e, key, isNote, skipDetailCheck) {
     if (fEarly && fEarly.media_type === 'movie') {
       var extras = currentFiles.filter(function(x){ return x.is_extra && x.main_key === key; });
       currentMovieDetail = {main: fEarly, extras: extras};
-      history.pushState({type:'movie', key: key}, '', '#movie=' + encodeURIComponent(key));
+      pushDetailState({type:'movie', key: key}, '#movie=' + encodeURIComponent(key));
       window.scrollTo(0, 0);
       if (viewMode === 'list') { renderList(currentFiles); } else { renderGrid(currentFiles); }
       return;
@@ -8518,11 +9605,20 @@ function openFile(e, key, isNote, skipDetailCheck) {
       var ltrack = document.createElement('track');
       ltrack.kind = 'subtitles'; ltrack.src = '/local/subtitle?path=' + encodeURIComponent(f.key);
       ltrack.srclang = 'en'; ltrack.label = 'English'; ltrack.default = true;
+      modalVideo.appendChild(ltrack);
+      // Set to 'showing' immediately rather than waiting for a 'load' event
+      // or for cues to appear: a TV's native fullscreen player (see
+      // requestVideoFullscreen's webkitEnterFullscreen path, entered right
+      // after this) reads track state at the moment fullscreen is entered —
+      // well before the VTT has even been fetched — so a mode flipped on
+      // later, once cues actually arrive, is too late for it to pick up. A
+      // file with genuinely no subtitle (404, so no cues ever arrive) still
+      // shows nothing either way; this only changes *when* the flag is set.
+      ltrack.track.mode = 'showing';
       var ccWired = false;
       var wireCC = function() {
         if (ccWired) return;
         ccWired = true;
-        ltrack.track.mode = 'showing';
         showOverlayBtn(modalCC);
         modalCC.textContent = 'CC on';
         modalCC.onclick = function() {
@@ -8534,16 +9630,25 @@ function openFile(e, key, isNote, skipDetailCheck) {
       ltrack.addEventListener('load', wireCC);
       // Confirmed on a Hisense TV's built-in browser: a <track>'s own 'load'
       // event never fires there even though the VTT actually fetched and its
-      // cues did load, so the CC toggle can't depend on that event alone —
+      // cues did load, so the CC toggle button (a separate concern from the
+      // mode above, which is already set) can't depend on that event alone —
       // fall back to checking the track's cues directly once the video has
-      // enough data to know. A file with genuinely no subtitle (404, so no
-      // cues ever arrive) still correctly gets no CC button either way.
+      // enough data to know.
       ['loadedmetadata', 'canplay'].forEach(function(ev) {
         modalVideo.addEventListener(ev, function() {
           if (!ccWired && ltrack.track && ltrack.track.cues && ltrack.track.cues.length) wireCC();
         });
       });
-      modalVideo.appendChild(ltrack);
+      // TV playback plays the exact same direct file the same way desktop
+      // does. Both a segmented-HLS/hls.js approach and an on-demand faststart
+      // MP4 remux were tried here to work around Hisense/VIDAA's unreliable
+      // seeking on the raw file -- the HLS path hit MSE-specific audio gaps
+      // (EAC3 never attached, then AAC played video with no sound on some
+      // titles) and the MP4 remux path failed outright ("could not find the
+      // video") on the TV. Direct playback is the one thing that has
+      // actually, reliably worked here throughout, seeking limitation and
+      // all, so back to it -- see requestVideoFullscreen below for the one
+      // TV-specific behavior kept.
       modalVideo.src = '/local/file?path=' + encodeURIComponent(f.key);
       resumePlayback(modalVideo, f.key, {fromStart: !!f.is_music_video});
       modalVideo.play().catch(function(){});
@@ -8555,6 +9660,11 @@ function openFile(e, key, isNote, skipDetailCheck) {
         track.kind = 'subtitles'; track.src = f.subtitle_url;
         track.srclang = 'en'; track.label = 'English'; track.default = true;
         modalVideo.appendChild(track);
+        // See the local-file branch above: a TV's native fullscreen player
+        // reads track state at the moment fullscreen is entered, which for
+        // this branch is right below, so the mode has to be set now rather
+        // than waiting on a 'load' event that may never fire.
+        track.track.mode = 'showing';
       } else if (f.tmdb_id) {
         showOverlayBtn(modalCC);
         modalCC.onclick = function(){ retrySubtitle(key); };
@@ -8576,6 +9686,11 @@ function openFile(e, key, isNote, skipDetailCheck) {
           dtrack.kind = 'subtitles'; dtrack.src = f.subtitle_url;
           dtrack.srclang = 'en'; dtrack.label = 'English'; dtrack.default = true;
           modalVideo.appendChild(dtrack);
+          // See the local-file branch above: a TV's native fullscreen player
+          // reads track state at the moment fullscreen is entered, which for
+          // this branch is right below, so the mode has to be set now rather
+          // than waiting on a 'load' event that may never fire.
+          dtrack.track.mode = 'showing';
         } else if (f.tmdb_id) {
           showOverlayBtn(modalCC);
           modalCC.onclick = function(){ retrySubtitle(key); };
@@ -8878,6 +9993,11 @@ function openPlayerCtxMenu(e) {
   if (peekNext()) {
     rows.push('<button class="ctx-item" data-act="next">Next</button>');
   }
+  var qRows = queueRows();
+  if (qRows.length) {
+    rows.push('<button class="ctx-item" data-act="queue">' +
+      '<span>Queue</span><span class="n">' + qRows.length + '</span></button>');
+  }
   if (rows.length) rows.push('<div class="ctx-sep"></div>');
   rows.push('<button class="ctx-item" data-act="minimize">' + (mini ? 'Restore' : 'Minimize') + '</button>');
   if (document.pictureInPictureEnabled && !modalVideo.disablePictureInPicture) {
@@ -8899,6 +10019,7 @@ function openPlayerCtxMenu(e) {
       closeCtxMenu();
       if (act === 'subtitles') { modalCC.click(); return; }
       if (act === 'next') { goNext(); return; }
+      if (act === 'queue') { openQueueDrawer(); return; }
       if (act === 'minimize') { if (modal.classList.contains('mini')) restorePlayer(); else minimizePlayer(); return; }
       if (act === 'pip') { modalVideo.requestPictureInPicture().catch(function(){}); return; }
       if (act === 'fullscreen') { requestVideoFullscreen(modalVideo); return; }
@@ -8962,10 +10083,17 @@ function syncPauseCard() {
   if (!pauseCard) return;
   var r = modalVideo.getBoundingClientRect();
   if (!r.width || !r.height) return;
+  // The 46px trim clears the full player's native control bar so
+  // bottom-anchored text doesn't sit on top of it -- mini has no such bar
+  // (the custom prev/play/next overlay stands in for it), so trimming the
+  // same amount there just meant "centered" text centered inside a box
+  // that was shorter than the mini player itself, landing above where the
+  // icons -- centered on the real, untrimmed box -- actually sit.
+  var mini = modal.classList.contains('mini');
   pauseCard.style.left = r.left + 'px';
   pauseCard.style.top = r.top + 'px';
   pauseCard.style.width = r.width + 'px';
-  pauseCard.style.height = Math.max(0, r.height - 46) + 'px';
+  pauseCard.style.height = (mini ? r.height : Math.max(0, r.height - 46)) + 'px';
 }
 
 modalVideo.addEventListener('pause', showPauseCard);
@@ -9187,9 +10315,15 @@ function reportProgress() {
 // the grid knows until it is rebuilt. Rebuilding scrolls you back to the top
 // unless the position is put back, so it is captured and restored.
 function refreshProgressView() {
-  if (currentShow || currentMovieDetail || viewMode === 'list') {
+  // A playlist page is a detail page like the other two -- missing here, it
+  // fell through to the branch below meant for the wall, which fully
+  // rebuilds *whatever renderGrid currently shows*. For the wall that's the
+  // point (see below); for a playlist it meant the entire detail page
+  // visibly tore down and rebuilt itself right after closing a video played
+  // from it -- the "still sometimes wipes" this was reported as.
+  if (currentShow || currentMovieDetail || currentPlaylist || viewMode === 'list') {
     return loadProgressMap().then(function(){
-      if (currentShow || currentMovieDetail) renderGrid(currentFiles);
+      if (currentShow || currentMovieDetail || currentPlaylist) renderGrid(currentFiles);
     });
   }
   var y = window.scrollY;
@@ -9269,6 +10403,7 @@ function retrySubtitle(key) {
       track.kind = 'subtitles'; track.src = updated.subtitle_url;
       track.srclang = 'en'; track.label = 'English'; track.default = true;
       modalVideo.appendChild(track);
+      track.track.mode = 'showing';
       modalCC.style.display = 'none';
     } else {
       modalCC.disabled = false;
@@ -9427,8 +10562,11 @@ window.addEventListener('popstate', function(e) {
     currentPlaylist = null;
     playlistQueue = null;
     currentSeason = null;
-    window.scrollTo(0, 0);
     if (viewMode === 'list') { renderList(currentFiles); } else { renderGrid(currentFiles); }
+    // Back to exactly where the wall was scrolled to before a show/movie/
+    // playlist was opened (see pushDetailState), not the top -- rendered
+    // first so the wall is tall enough to actually scroll there.
+    window.scrollTo(0, (st && st.scrollY) || 0);
   } else if (st.type === 'show') {
     var regularItems = currentFiles.filter(function(f){ return !f.is_music_video && !f.is_extra; });
     var grouped = groupBySeries(regularItems);
@@ -9917,6 +11055,7 @@ func buildServer(c *serverCtx) *http.Server {
 	mux.HandleFunc("/search/torrents", c.localOnly(c.handleSearchTorrents))
 	mux.HandleFunc("/search/music", c.localOnly(c.handleSearchMusic))
 	mux.HandleFunc("/api/history", c.handleHistory)
+	mux.HandleFunc("/windows-app/version", c.handleWindowsAppVersion)
 	mux.HandleFunc("/playlists", c.handlePlaylists)
 	mux.HandleFunc("/playlists/cover", c.handlePlaylistCover)
 	mux.HandleFunc("/download/music", c.localOnly(c.handleDownloadMusic))
@@ -10073,11 +11212,58 @@ func startServer() *http.Server {
 	return srv
 }
 
+// logFile is the handle watchLogSize rotates in place. Only set when
+// runAsService successfully opens stream.log -- nil under log.Default().
+var logFile *os.File
+
+// rotateLogIfLarge moves an oversized stream.log aside (overwriting any
+// previous .old) before the fresh handle below is opened, so a long-running
+// service's log doesn't grow forever between redeploys. Best-effort: a
+// failure here just means logging continues on whatever already exists.
+func rotateLogIfLarge(logPath string) {
+	info, err := os.Stat(logPath)
+	if err != nil || info.Size() < maxLogSize {
+		return
+	}
+	old := logPath + ".old"
+	os.Remove(old)
+	os.Rename(logPath, old)
+}
+
+// watchLogSize rotates stream.log while the service is running, not just at
+// startup -- rotateLogIfLarge alone only catches this on a redeploy, so a
+// service left running for months would otherwise log forever in between.
+// log.Logger.SetOutput takes its own internal mutex, so this is safe to swap
+// underneath concurrent logger.Printf calls elsewhere.
+func watchLogSize(logPath string) {
+	ticker := time.NewTicker(time.Hour)
+	defer ticker.Stop()
+	for range ticker.C {
+		info, err := logFile.Stat()
+		if err != nil || info.Size() < maxLogSize {
+			continue
+		}
+		logFile.Close()
+		old := logPath + ".old"
+		os.Remove(old)
+		os.Rename(logPath, old)
+		nf, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+		if err != nil {
+			continue
+		}
+		logFile = nf
+		logger.SetOutput(nf)
+	}
+}
+
 func runAsService(exePath string) {
 	logPath := filepath.Join(filepath.Dir(exePath), "stream.log")
+	rotateLogIfLarge(logPath)
 	lf, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
 	if err == nil {
+		logFile = lf
 		logger = log.New(lf, "", log.LstdFlags)
+		go watchLogSize(logPath)
 	} else {
 		logger = log.Default()
 	}

@@ -10,3 +10,7 @@ playlists.json
 watch_history.json
 playback_progress.json
 swap-result.txt
+start-result.txt
+stop-result.txt
+playlist_covers/
+_pruned-*/

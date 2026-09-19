@@ -1,0 +1,23 @@
+<Window x:Class="StreamVideosPlayer.LoginWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Connect — Stream" Height="280" Width="380" Icon="app.ico"
+        WindowStartupLocation="CenterScreen" ResizeMode="NoResize" Background="#1e1e1e">
+    <StackPanel Margin="24" VerticalAlignment="Center">
+        <TextBlock Text="Server URL" Foreground="White" Margin="0,0,0,4"/>
+        <TextBox x:Name="ServerUrlBox" Margin="0,0,0,12" Padding="4" Text="https://"/>
+
+        <!-- Hidden until a password-less connect attempt fails. A server
+             reached from its own LAN never needs one (see isAuthed in
+             main.go), so most local setups never see this at all. -->
+        <TextBlock x:Name="PasswordLabel" Text="Password" Foreground="White" Margin="0,0,0,4"
+                   Visibility="Collapsed"/>
+        <PasswordBox x:Name="PasswordBox" Margin="0,0,0,12" Padding="4" KeyDown="PasswordBox_KeyDown"
+                     Visibility="Collapsed"/>
+
+        <TextBlock x:Name="ErrorText" Foreground="#ff6b6b" Margin="0,0,0,8"
+                   TextWrapping="Wrap" Visibility="Collapsed"/>
+
+        <Button x:Name="ConnectButton" Content="Connect" Height="32" Click="ConnectButton_Click"/>
+    </StackPanel>
+</Window>

@@ -1,0 +1,6 @@
+bin/
+obj/
+*.user
+publish/
+*.zip
+Output/
