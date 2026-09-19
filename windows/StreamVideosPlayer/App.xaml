@@ -317,10 +317,27 @@
                  Shared (not window-scoped) so the playlist detail window and
                  the queue drawer render identical cards. -->
             <DataTemplate x:Key="FileCardTemplate">
-                <Grid x:Name="CardRoot" Width="150" Height="240" Margin="7">
+                <!-- Matches #file-grid/#other-grid's real geometry: a fixed
+                     5-column grid at the site's 980px shell width, 18px gap:
+                     169x254 (2:3) with a 9px margin (half the 18px gap on
+                     each side) is that grid's actual per-card size, not an
+                     arbitrary pick. Same card/grid the web uses for Library
+                     ("Other" there), not a wide one: see AddFileSection. -->
+                <Grid x:Name="CardRoot" Width="169" Height="254" Margin="9">
                     <Border CornerRadius="6" Background="{StaticResource Bg3Brush}" ClipToBounds="True">
                         <Grid>
-                            <Image Source="{Binding CardImageUrl}">
+                            <!-- Hover zoom, matching .pc-cover img's own
+                                 transform:scale(1.045) (see .card:hover
+                                 .pc-cover img in main.go). The CSS
+                                 filter:brightness(1.1) alongside it has no
+                                 direct WPF equivalent without a pixel shader;
+                                 BrightnessWash below (a low-opacity white
+                                 wash faded in on the same trigger) is a
+                                 cheap, close-enough approximation. -->
+                            <Image x:Name="CoverImage" Source="{Binding CardImageUrl}" RenderTransformOrigin="0.5,0.5">
+                                <Image.RenderTransform>
+                                    <ScaleTransform ScaleX="1" ScaleY="1"/>
+                                </Image.RenderTransform>
                                 <Image.Style>
                                     <Style TargetType="Image">
                                         <Setter Property="Visibility" Value="Visible"/>
@@ -339,10 +356,52 @@
                                             <DataTrigger Binding="{Binding PosterUrl}" Value="{x:Null}">
                                                 <Setter Property="Stretch" Value="Uniform"/>
                                             </DataTrigger>
+                                            <DataTrigger Binding="{Binding ProcState}" Value="processing">
+                                                <Setter Property="Visibility" Value="Collapsed"/>
+                                            </DataTrigger>
+                                            <DataTrigger Binding="{Binding ProcState}" Value="error">
+                                                <Setter Property="Visibility" Value="Collapsed"/>
+                                            </DataTrigger>
                                         </Style.Triggers>
                                     </Style>
                                 </Image.Style>
                             </Image>
+                            <Border x:Name="BrightnessWash" Background="White" Opacity="0" IsHitTestVisible="False"/>
+
+                            <!-- Processing/error state, matching .pc-proc:
+                                 a spinner glyph while a file is still being
+                                 transcoded/probed, or a red-tinted ✕ if that
+                                 failed. Takes over the whole cover either
+                                 way, same as the site. -->
+                            <Border x:Name="ProcOverlay" Visibility="Collapsed">
+                                <TextBlock FontSize="26" HorizontalAlignment="Center" VerticalAlignment="Center">
+                                    <TextBlock.Style>
+                                        <Style TargetType="TextBlock">
+                                            <Setter Property="Text" Value="&#9696;"/>
+                                            <Setter Property="Foreground" Value="{StaticResource MutedBrush}"/>
+                                            <Style.Triggers>
+                                                <DataTrigger Binding="{Binding ProcState}" Value="error">
+                                                    <Setter Property="Text" Value="&#10005;"/>
+                                                    <Setter Property="Foreground" Value="#E06C6C"/>
+                                                </DataTrigger>
+                                            </Style.Triggers>
+                                        </Style>
+                                    </TextBlock.Style>
+                                </TextBlock>
+                                <Border.Style>
+                                    <Style TargetType="Border">
+                                        <Style.Triggers>
+                                            <DataTrigger Binding="{Binding ProcState}" Value="processing">
+                                                <Setter Property="Visibility" Value="Visible"/>
+                                            </DataTrigger>
+                                            <DataTrigger Binding="{Binding ProcState}" Value="error">
+                                                <Setter Property="Visibility" Value="Visible"/>
+                                                <Setter Property="Background" Value="#B85A1414"/>
+                                            </DataTrigger>
+                                        </Style.Triggers>
+                                    </Style>
+                                </Border.Style>
+                            </Border>
 
                             <!-- No-art fallback -->
                             <Border Background="{StaticResource Bg3Brush}" Padding="12,10">
@@ -410,6 +469,12 @@
                     <Trigger SourceName="CardRoot" Property="IsMouseOver" Value="True">
                         <Setter TargetName="Overlay" Property="Opacity" Value="1"/>
                         <Setter TargetName="CardMoreButton" Property="Opacity" Value="1"/>
+                        <Setter TargetName="CoverImage" Property="RenderTransform">
+                            <Setter.Value>
+                                <ScaleTransform ScaleX="1.045" ScaleY="1.045"/>
+                            </Setter.Value>
+                        </Setter>
+                        <Setter TargetName="BrightnessWash" Property="Opacity" Value="0.08"/>
                     </Trigger>
                 </DataTemplate.Triggers>
             </DataTemplate>
@@ -454,92 +519,123 @@
                 <Setter Property="ScrollViewer.VerticalScrollBarVisibility" Value="Auto"/>
             </Style>
 
-            <!-- Wide 16:9 variant of FileCardTemplate for Continue
-                 watching/Music videos/Library, matching the web UI's own
-                 .cw-shot cards: these show an actual frame from the video
-                 (ThumbnailImageUrl), not a 2:3 poster forced into the wrong
-                 shape, which is what "wrong aspect ratio" turned out to mean
-                 for anything that isn't a Film/Series poster. -->
-            <DataTemplate x:Key="FileCardTemplateWide">
-                <Grid x:Name="CardRoot" Width="266" Height="150" Margin="7">
+            <!-- Show tile for the Series rail, matching renderShowCard
+                 exactly: a near-copy of FileCardTemplate above (same 2:3
+                 poster shape, same hover-reveal caption), but the caption's
+                 second line is "{count} episodes"/"{n} seasons" (see
+                 seriesCount in main.go), not a star rating: a show has no
+                 single rating of its own, and there's no overflow button
+                 (renderShowCard has no cardMoreHTML() call either; queueing/
+                 playlisting only makes sense for one playable episode, not
+                 a whole show). Bound to ShowGroup, one per unique tmdb_id,
+                 not one card per episode. -->
+            <DataTemplate x:Key="ShowCardTemplate">
+                <Grid x:Name="CardRoot" Width="169" Height="254" Margin="9">
                     <Border CornerRadius="6" Background="{StaticResource Bg3Brush}" ClipToBounds="True">
                         <Grid>
-                            <Image Source="{Binding ThumbnailImageUrl}" Stretch="UniformToFill">
+                            <Image x:Name="CoverImage" Source="{Binding CardImageUrl}" RenderTransformOrigin="0.5,0.5">
+                                <Image.RenderTransform>
+                                    <ScaleTransform ScaleX="1" ScaleY="1"/>
+                                </Image.RenderTransform>
                                 <Image.Style>
                                     <Style TargetType="Image">
                                         <Setter Property="Visibility" Value="Visible"/>
+                                        <Setter Property="Stretch" Value="UniformToFill"/>
                                         <Style.Triggers>
-                                            <DataTrigger Binding="{Binding ThumbnailImageUrl}" Value="{x:Null}">
+                                            <DataTrigger Binding="{Binding CardImageUrl}" Value="{x:Null}">
                                                 <Setter Property="Visibility" Value="Collapsed"/>
+                                            </DataTrigger>
+                                            <DataTrigger Binding="{Binding PosterUrl}" Value="{x:Null}">
+                                                <Setter Property="Stretch" Value="Uniform"/>
                                             </DataTrigger>
                                         </Style.Triggers>
                                     </Style>
                                 </Image.Style>
                             </Image>
+                            <Border x:Name="BrightnessWash" Background="White" Opacity="0" IsHitTestVisible="False"/>
 
                             <Border Background="{StaticResource Bg3Brush}" Padding="12,10">
                                 <Border.Style>
                                     <Style TargetType="Border">
                                         <Setter Property="Visibility" Value="Collapsed"/>
                                         <Style.Triggers>
-                                            <DataTrigger Binding="{Binding ThumbnailImageUrl}" Value="{x:Null}">
+                                            <DataTrigger Binding="{Binding CardImageUrl}" Value="{x:Null}">
                                                 <Setter Property="Visibility" Value="Visible"/>
                                             </DataTrigger>
                                         </Style.Triggers>
                                     </Style>
                                 </Border.Style>
                                 <TextBlock Text="{Binding DisplayTitle}" Foreground="{StaticResource TextBrush}"
-                                           FontFamily="{StaticResource SerifFont}" FontWeight="Bold" FontSize="13"
+                                           FontFamily="{StaticResource SerifFont}" FontWeight="Bold" FontSize="14"
                                            TextWrapping="Wrap" VerticalAlignment="Center"/>
                             </Border>
 
-                            <Border x:Name="Overlay" VerticalAlignment="Bottom" Opacity="0" Padding="9,7">
+                            <Border x:Name="Overlay" VerticalAlignment="Bottom" Opacity="0" Padding="9,8">
                                 <Border.Background>
                                     <LinearGradientBrush StartPoint="0,1" EndPoint="0,0">
                                         <GradientStop Color="#EB000000" Offset="0"/>
-                                        <GradientStop Color="#73000000" Offset="0.42"/>
-                                        <GradientStop Color="#00000000" Offset="0.75"/>
+                                        <GradientStop Color="#73000000" Offset="0.38"/>
+                                        <GradientStop Color="#00000000" Offset="0.68"/>
                                     </LinearGradientBrush>
                                 </Border.Background>
-                                <TextBlock Text="{Binding DisplayTitle}" Foreground="White" FontSize="11"
-                                           TextWrapping="Wrap" MaxHeight="32" TextTrimming="CharacterEllipsis"/>
+                                <StackPanel>
+                                    <TextBlock Text="{Binding DisplayTitle}" Foreground="White" FontSize="12"
+                                               TextWrapping="Wrap" MaxHeight="48" TextTrimming="CharacterEllipsis"/>
+                                    <TextBlock Text="{Binding CountLabel}" Foreground="{StaticResource GoldTextBrush}"
+                                               FontFamily="{StaticResource MonoFont}" FontSize="10" Margin="0,3,0,0"/>
+                                </StackPanel>
                             </Border>
 
                             <ProgressBar Style="{StaticResource FlatProgressBar}" VerticalAlignment="Bottom"
                                          Value="{Binding Progress, Mode=OneTime}"/>
-
-                            <Button x:Name="CardMoreButton" Content="⋮" Style="{StaticResource CardMoreButtonStyle}"
-                                    HorizontalAlignment="Right" VerticalAlignment="Top" Opacity="0"/>
                         </Grid>
                     </Border>
                 </Grid>
                 <DataTemplate.Triggers>
                     <Trigger SourceName="CardRoot" Property="IsMouseOver" Value="True">
                         <Setter TargetName="Overlay" Property="Opacity" Value="1"/>
-                        <Setter TargetName="CardMoreButton" Property="Opacity" Value="1"/>
+                        <Setter TargetName="CoverImage" Property="RenderTransform">
+                            <Setter.Value>
+                                <ScaleTransform ScaleX="1.045" ScaleY="1.045"/>
+                            </Setter.Value>
+                        </Setter>
+                        <Setter TargetName="BrightnessWash" Property="Opacity" Value="0.08"/>
                     </Trigger>
                 </DataTemplate.Triggers>
             </DataTemplate>
 
-            <Style x:Key="WideCardListBox" TargetType="ListBox" BasedOn="{StaticResource CardListBox}">
-                <Setter Property="ItemTemplate" Value="{StaticResource FileCardTemplateWide}"/>
+            <Style x:Key="ShowCardListBox" TargetType="ListBox" BasedOn="{StaticResource CardListBox}">
+                <Setter Property="ItemTemplate" Value="{StaticResource ShowCardTemplate}"/>
             </Style>
 
             <!-- Continue Watching's own card, matching .cw-shot/.cw-bar/
-                 .cw-meta/.cw-t/.cw-s exactly: unlike FileCardTemplateWide
-                 above, the caption sits permanently below the image (not a
-                 hover-reveal overlay on top of it), with the progress bar
-                 staying on the image itself. -->
+                 .cw-meta/.cw-t/.cw-s exactly: the caption sits permanently
+                 below the image (not a hover-reveal overlay on top of it),
+                 with the progress bar staying on the image itself. Sized to
+                 match .cw-rail's real geometry: repeat(auto-fill,minmax
+                 (230px,1fr)) at the site's 980px shell settles on 3 columns
+                 of ~295px each with a 16px gap (8px margin per side), not
+                 an arbitrary width. Playlists reuse this same grid+size on
+                 the web (.cw-rail is literally what wallEls.plRail is), so
+                 PlaylistCardListBox below is built to match, not coincidence. -->
             <DataTemplate x:Key="ContinueWatchingCardTemplate">
-                <Grid x:Name="CardRoot" Width="266" Margin="7">
+                <Grid x:Name="CardRoot" Width="295" Margin="8">
                     <Grid.RowDefinitions>
-                        <RowDefinition Height="150"/>
+                        <RowDefinition Height="166"/>
                         <RowDefinition Height="Auto"/>
                     </Grid.RowDefinitions>
 
                     <Border Grid.Row="0" CornerRadius="6" Background="{StaticResource Bg3Brush}" ClipToBounds="True">
                         <Grid>
-                            <Image Source="{Binding ThumbnailImageUrl}" Stretch="UniformToFill">
+                            <!-- Hover zoom, matching .cw-shot img's
+                                 transform:scale(1.04); BrightnessWash
+                                 approximates the accompanying
+                                 filter:brightness(1.1), see FileCardTemplate. -->
+                            <Image x:Name="CoverImage" Source="{Binding ThumbnailImageUrl}" Stretch="UniformToFill"
+                                   RenderTransformOrigin="0.5,0.5">
+                                <Image.RenderTransform>
+                                    <ScaleTransform ScaleX="1" ScaleY="1"/>
+                                </Image.RenderTransform>
                                 <Image.Style>
                                     <Style TargetType="Image">
                                         <Setter Property="Visibility" Value="Visible"/>
@@ -551,6 +647,7 @@
                                     </Style>
                                 </Image.Style>
                             </Image>
+                            <Border x:Name="BrightnessWash" Background="White" Opacity="0" IsHitTestVisible="False"/>
 
                             <TextBlock Text="&#9654;" FontSize="22" Foreground="{StaticResource MutedBrush}"
                                        HorizontalAlignment="Center" VerticalAlignment="Center">
@@ -565,6 +662,37 @@
                                     </Style>
                                 </TextBlock.Style>
                             </TextBlock>
+
+                            <!-- Processing/error state, matching .pc-proc: see FileCardTemplate. -->
+                            <Border x:Name="ProcOverlay" Visibility="Collapsed">
+                                <TextBlock FontSize="22" HorizontalAlignment="Center" VerticalAlignment="Center">
+                                    <TextBlock.Style>
+                                        <Style TargetType="TextBlock">
+                                            <Setter Property="Text" Value="&#9696;"/>
+                                            <Setter Property="Foreground" Value="{StaticResource MutedBrush}"/>
+                                            <Style.Triggers>
+                                                <DataTrigger Binding="{Binding ProcState}" Value="error">
+                                                    <Setter Property="Text" Value="&#10005;"/>
+                                                    <Setter Property="Foreground" Value="#E06C6C"/>
+                                                </DataTrigger>
+                                            </Style.Triggers>
+                                        </Style>
+                                    </TextBlock.Style>
+                                </TextBlock>
+                                <Border.Style>
+                                    <Style TargetType="Border">
+                                        <Style.Triggers>
+                                            <DataTrigger Binding="{Binding ProcState}" Value="processing">
+                                                <Setter Property="Visibility" Value="Visible"/>
+                                            </DataTrigger>
+                                            <DataTrigger Binding="{Binding ProcState}" Value="error">
+                                                <Setter Property="Visibility" Value="Visible"/>
+                                                <Setter Property="Background" Value="#B85A1414"/>
+                                            </DataTrigger>
+                                        </Style.Triggers>
+                                    </Style>
+                                </Border.Style>
+                            </Border>
 
                             <ProgressBar Style="{StaticResource FlatProgressBar}" VerticalAlignment="Bottom"
                                          Value="{Binding Progress, Mode=OneTime}"/>
@@ -585,6 +713,12 @@
                 <DataTemplate.Triggers>
                     <Trigger SourceName="CardRoot" Property="IsMouseOver" Value="True">
                         <Setter TargetName="CardMoreButton" Property="Opacity" Value="1"/>
+                        <Setter TargetName="CoverImage" Property="RenderTransform">
+                            <Setter.Value>
+                                <ScaleTransform ScaleX="1.04" ScaleY="1.04"/>
+                            </Setter.Value>
+                        </Setter>
+                        <Setter TargetName="BrightnessWash" Property="Opacity" Value="0.08"/>
                     </Trigger>
                 </DataTemplate.Triggers>
             </DataTemplate>
@@ -622,39 +756,341 @@
                 </Setter>
             </Style>
 
-            <!-- Playlist tile for the Playlists section, 16:9-ish, matching
-                 .pl-cover on the web (a wide cover rather than a poster's
-                 2:3), since no cover-image binding is wired up yet this is
-                 just a named tile; PlaylistDetailWindow opens on click. -->
-            <DataTemplate x:Key="PlaylistCardTemplate">
-                <Border Width="220" Height="140" Margin="7" CornerRadius="6" Cursor="Hand"
-                        Background="{StaticResource Bg3Brush}" BorderBrush="{StaticResource BorderBrush2}"
-                        BorderThickness="1">
-                    <StackPanel VerticalAlignment="Center" HorizontalAlignment="Center" Margin="12">
-                        <TextBlock Text="{Binding Name}" Foreground="{StaticResource TextBrush}"
-                                   FontFamily="{StaticResource SerifFont}" FontSize="15" FontWeight="Bold"
-                                   HorizontalAlignment="Center" TextWrapping="Wrap" TextAlignment="Center"
-                                   MaxWidth="190"/>
-                        <TextBlock Text="{Binding Items.Count, StringFormat='{}{0} items'}"
-                                   Foreground="{StaticResource MutedBrush}" FontFamily="{StaticResource MonoFont}"
-                                   FontSize="10" HorizontalAlignment="Center" Margin="0,6,0,0"/>
+            <!-- Music video card, matching .mv2-card/.mv2-cover/.pc-info/
+                 .pc-title/.pc-year exactly: a 16:9 still with a PERMANENT
+                 caption below it (title + artist), not the hover-reveal
+                 overlay Films/Series use, and no progress bar (music videos
+                 aren't part of Continue Watching). Sized to #music-grid's
+                 real geometry: repeat(auto-fill,minmax(215px,1fr)) at the
+                 980px shell settles on 3 columns of ~289px, gap 24px
+                 horizontal / 28px vertical: an asymmetric margin
+                 (12 L/R, 14 T/B) reproduces that row-gap-vs-column-gap
+                 split, which a single uniform gap number can't. -->
+            <DataTemplate x:Key="MusicVideoCardTemplate">
+                <Grid x:Name="CardRoot" Width="289" Margin="12,14,12,14">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="163"/>
+                        <RowDefinition Height="Auto"/>
+                    </Grid.RowDefinitions>
+
+                    <Border Grid.Row="0" CornerRadius="6" Background="{StaticResource Bg3Brush}" ClipToBounds="True">
+                        <Grid>
+                            <!-- Hover zoom, matching .mv2-cover img's
+                                 transform:scale(1.045); BrightnessWash
+                                 approximates its filter:brightness(1.18). -->
+                            <Image x:Name="CoverImage" Source="{Binding ThumbnailImageUrl}" Stretch="UniformToFill"
+                                   RenderTransformOrigin="0.5,0.5">
+                                <Image.RenderTransform>
+                                    <ScaleTransform ScaleX="1" ScaleY="1"/>
+                                </Image.RenderTransform>
+                                <Image.Style>
+                                    <Style TargetType="Image">
+                                        <Setter Property="Visibility" Value="Visible"/>
+                                        <Style.Triggers>
+                                            <DataTrigger Binding="{Binding ThumbnailImageUrl}" Value="{x:Null}">
+                                                <Setter Property="Visibility" Value="Collapsed"/>
+                                            </DataTrigger>
+                                        </Style.Triggers>
+                                    </Style>
+                                </Image.Style>
+                            </Image>
+                            <Border x:Name="BrightnessWash" Background="White" Opacity="0" IsHitTestVisible="False"/>
+
+                            <TextBlock Text="&#9834;" FontSize="22" Foreground="{StaticResource MutedBrush}"
+                                       HorizontalAlignment="Center" VerticalAlignment="Center">
+                                <TextBlock.Style>
+                                    <Style TargetType="TextBlock">
+                                        <Setter Property="Visibility" Value="Collapsed"/>
+                                        <Style.Triggers>
+                                            <DataTrigger Binding="{Binding ThumbnailImageUrl}" Value="{x:Null}">
+                                                <Setter Property="Visibility" Value="Visible"/>
+                                            </DataTrigger>
+                                        </Style.Triggers>
+                                    </Style>
+                                </TextBlock.Style>
+                            </TextBlock>
+
+                            <!-- Processing/error state, matching .pc-proc: see FileCardTemplate. -->
+                            <Border x:Name="ProcOverlay" Visibility="Collapsed">
+                                <TextBlock FontSize="22" HorizontalAlignment="Center" VerticalAlignment="Center">
+                                    <TextBlock.Style>
+                                        <Style TargetType="TextBlock">
+                                            <Setter Property="Text" Value="&#9696;"/>
+                                            <Setter Property="Foreground" Value="{StaticResource MutedBrush}"/>
+                                            <Style.Triggers>
+                                                <DataTrigger Binding="{Binding ProcState}" Value="error">
+                                                    <Setter Property="Text" Value="&#10005;"/>
+                                                    <Setter Property="Foreground" Value="#E06C6C"/>
+                                                </DataTrigger>
+                                            </Style.Triggers>
+                                        </Style>
+                                    </TextBlock.Style>
+                                </TextBlock>
+                                <Border.Style>
+                                    <Style TargetType="Border">
+                                        <Style.Triggers>
+                                            <DataTrigger Binding="{Binding ProcState}" Value="processing">
+                                                <Setter Property="Visibility" Value="Visible"/>
+                                            </DataTrigger>
+                                            <DataTrigger Binding="{Binding ProcState}" Value="error">
+                                                <Setter Property="Visibility" Value="Visible"/>
+                                                <Setter Property="Background" Value="#B85A1414"/>
+                                            </DataTrigger>
+                                        </Style.Triggers>
+                                    </Style>
+                                </Border.Style>
+                            </Border>
+
+                            <Button x:Name="CardMoreButton" Content="⋮" Style="{StaticResource CardMoreButtonStyle}"
+                                    HorizontalAlignment="Right" VerticalAlignment="Top" Opacity="0"/>
+                        </Grid>
+                    </Border>
+
+                    <StackPanel Grid.Row="1" Margin="0,8,0,0">
+                        <TextBlock Text="{Binding DisplayTitle}" Foreground="#D0D0D0"
+                                   FontFamily="{StaticResource SansFont}" FontSize="12" LineHeight="16"
+                                   TextWrapping="Wrap" MaxHeight="32" TextTrimming="CharacterEllipsis"/>
+                        <TextBlock Foreground="#686868" FontFamily="{StaticResource SansFont}" FontSize="10"
+                                   Margin="0,2,0,0">
+                            <TextBlock.Style>
+                                <Style TargetType="TextBlock">
+                                    <Setter Property="Text" Value="{Binding Artist}"/>
+                                    <Style.Triggers>
+                                        <DataTrigger Binding="{Binding Artist}" Value="{x:Null}">
+                                            <Setter Property="Visibility" Value="Collapsed"/>
+                                        </DataTrigger>
+                                    </Style.Triggers>
+                                </Style>
+                            </TextBlock.Style>
+                        </TextBlock>
                     </StackPanel>
-                </Border>
+                </Grid>
+                <DataTemplate.Triggers>
+                    <Trigger SourceName="CardRoot" Property="IsMouseOver" Value="True">
+                        <Setter TargetName="CardMoreButton" Property="Opacity" Value="1"/>
+                        <Setter TargetName="CoverImage" Property="RenderTransform">
+                            <Setter.Value>
+                                <ScaleTransform ScaleX="1.045" ScaleY="1.045"/>
+                            </Setter.Value>
+                        </Setter>
+                        <Setter TargetName="BrightnessWash" Property="Opacity" Value="0.1"/>
+                    </Trigger>
+                </DataTemplate.Triggers>
             </DataTemplate>
 
-            <Style x:Key="PlaylistCardListBox" TargetType="ListBox">
+            <Style x:Key="MusicVideoCardListBox" TargetType="ListBox" BasedOn="{StaticResource CardListBox}">
+                <Setter Property="ItemTemplate" Value="{StaticResource MusicVideoCardTemplate}"/>
+            </Style>
+
+            <!-- Playlist tile, matching .pl-card/.pl-cover/.pl-play/.pl-meta/
+                 .pl-name/.pl-count exactly: the server-composed cover image
+                 (CoverImage, fetched via GetPlaylistCoverAsync since an Image
+                 bound straight to the /playlists/cover URL can't carry the
+                 session cookie that route requires), a circular play button
+                 that fades in on hover, and a permanent title+count caption
+                 below the cover. main.go's own plRail is literally a
+                 .cw-rail (see wallEls.plRail), so this reuses
+                 ContinueWatchingCardTemplate's exact sizing, not a
+                 coincidence. -->
+            <DataTemplate x:Key="PlaylistCardTemplate">
+                <Grid x:Name="CardRoot" Width="295" Margin="8">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="166"/>
+                        <RowDefinition Height="Auto"/>
+                    </Grid.RowDefinitions>
+
+                    <!-- Hover glow, matching .pl-card:hover .pl-cover's
+                         box-shadow:0 0 16px 1px rgba(255,255,255,.22): a
+                         glow rather than the zoom the other card types get,
+                         since .pl-cover has no img:hover transform rule. -->
+                    <Border x:Name="CoverBorder" Grid.Row="0" CornerRadius="6" Background="{StaticResource Bg3Brush}" ClipToBounds="True">
+                        <Grid>
+                            <Image Source="{Binding CoverImage}" Stretch="UniformToFill">
+                                <Image.Style>
+                                    <Style TargetType="Image">
+                                        <Setter Property="Visibility" Value="Visible"/>
+                                        <Style.Triggers>
+                                            <DataTrigger Binding="{Binding CoverImage}" Value="{x:Null}">
+                                                <Setter Property="Visibility" Value="Collapsed"/>
+                                            </DataTrigger>
+                                        </Style.Triggers>
+                                    </Style>
+                                </Image.Style>
+                            </Image>
+
+                            <!-- .pl-empty: no cover to compose (an empty
+                                 playlist) or the fetch failed. -->
+                            <TextBlock Text="&#9834;" FontSize="24" Foreground="{StaticResource MutedBrush}"
+                                       HorizontalAlignment="Center" VerticalAlignment="Center">
+                                <TextBlock.Style>
+                                    <Style TargetType="TextBlock">
+                                        <Setter Property="Visibility" Value="Collapsed"/>
+                                        <Style.Triggers>
+                                            <DataTrigger Binding="{Binding CoverImage}" Value="{x:Null}">
+                                                <Setter Property="Visibility" Value="Visible"/>
+                                            </DataTrigger>
+                                        </Style.Triggers>
+                                    </Style>
+                                </TextBlock.Style>
+                            </TextBlock>
+
+                            <Button x:Name="PlayButton" Content="&#9654;" Width="34" Height="34" Opacity="0"
+                                    HorizontalAlignment="Right" VerticalAlignment="Bottom" Margin="0,0,10,10"
+                                    Background="{StaticResource PlayBrush}" Foreground="White" BorderThickness="0"
+                                    FontSize="12" Cursor="Hand">
+                                <Button.Style>
+                                    <Style TargetType="Button">
+                                        <Setter Property="Template">
+                                            <Setter.Value>
+                                                <ControlTemplate TargetType="Button">
+                                                    <Border Background="{TemplateBinding Background}" CornerRadius="999">
+                                                        <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                                                    </Border>
+                                                    <ControlTemplate.Triggers>
+                                                        <Trigger Property="IsMouseOver" Value="True">
+                                                            <Setter Property="Background" Value="{StaticResource PlayLitBrush}"/>
+                                                        </Trigger>
+                                                    </ControlTemplate.Triggers>
+                                                </ControlTemplate>
+                                            </Setter.Value>
+                                        </Setter>
+                                        <Style.Triggers>
+                                            <DataTrigger Binding="{Binding CoverImage}" Value="{x:Null}">
+                                                <Setter Property="Visibility" Value="Collapsed"/>
+                                            </DataTrigger>
+                                        </Style.Triggers>
+                                    </Style>
+                                </Button.Style>
+                            </Button>
+                        </Grid>
+                    </Border>
+
+                    <StackPanel Grid.Row="1" Margin="0,8,0,0">
+                        <TextBlock Text="{Binding Name}" Foreground="{StaticResource TextBrush}"
+                                   FontFamily="{StaticResource SansFont}" FontSize="13" LineHeight="17"
+                                   TextWrapping="Wrap" MaxHeight="34" TextTrimming="CharacterEllipsis"/>
+                        <TextBlock Foreground="{StaticResource MutedBrush}" FontFamily="{StaticResource MonoFont}"
+                                   FontSize="10.5" Margin="0,3,0,0">
+                            <TextBlock.Style>
+                                <Style TargetType="TextBlock">
+                                    <Setter Property="Text" Value="{Binding Items.Count, StringFormat='{}{0} items'}"/>
+                                    <Style.Triggers>
+                                        <DataTrigger Binding="{Binding Items.Count}" Value="1">
+                                            <Setter Property="Text" Value="1 item"/>
+                                        </DataTrigger>
+                                    </Style.Triggers>
+                                </Style>
+                            </TextBlock.Style>
+                        </TextBlock>
+                    </StackPanel>
+                </Grid>
+                <DataTemplate.Triggers>
+                    <Trigger SourceName="CardRoot" Property="IsMouseOver" Value="True">
+                        <Setter TargetName="PlayButton" Property="Opacity" Value="1"/>
+                        <Setter TargetName="CoverBorder" Property="Effect">
+                            <Setter.Value>
+                                <DropShadowEffect Color="White" BlurRadius="16" ShadowDepth="0" Opacity="0.55"/>
+                            </Setter.Value>
+                        </Setter>
+                    </Trigger>
+                </DataTemplate.Triggers>
+            </DataTemplate>
+
+            <Style x:Key="PlaylistCardListBox" TargetType="ListBox" BasedOn="{StaticResource CardListBox}">
+                <Setter Property="ItemTemplate" Value="{StaticResource PlaylistCardTemplate}"/>
+            </Style>
+
+            <!-- Episode row for ShowDetailWindow (FilmDetailWindow's own
+                 Extras list reuses ContinueWatchingCardTemplate instead,
+                 since extras are single playable clips, not a numbered
+                 episode sequence with its own overview text the way
+                 episodes are). Matches .sv-ep-row/.sv-ep-shot/.sv-ep-info/
+                 .sv-ep-head/.sv-ep-name/.sv-ep-time/.sv-ep-desc: number,
+                 still with its own progress sliver, title + duration,
+                 overview, as a vertical list rather than a wrapping card
+                 wall. -->
+            <DataTemplate x:Key="EpisodeRowTemplate">
+                <Grid Margin="0,0,0,14" Cursor="Hand">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="30"/>
+                        <ColumnDefinition Width="160"/>
+                        <ColumnDefinition Width="*"/>
+                    </Grid.ColumnDefinitions>
+                    <TextBlock Grid.Column="0" Text="{Binding Episode}" Foreground="{StaticResource MutedBrush}"
+                               FontFamily="{StaticResource MonoFont}" FontSize="13" VerticalAlignment="Center"
+                               HorizontalAlignment="Center"/>
+                    <Border Grid.Column="1" Height="90" CornerRadius="4" Background="{StaticResource Bg3Brush}"
+                            ClipToBounds="True">
+                        <Grid>
+                            <Image Source="{Binding ThumbnailImageUrl}" Stretch="UniformToFill">
+                                <Image.Style>
+                                    <Style TargetType="Image">
+                                        <Setter Property="Visibility" Value="Visible"/>
+                                        <Style.Triggers>
+                                            <DataTrigger Binding="{Binding ThumbnailImageUrl}" Value="{x:Null}">
+                                                <Setter Property="Visibility" Value="Collapsed"/>
+                                            </DataTrigger>
+                                        </Style.Triggers>
+                                    </Style>
+                                </Image.Style>
+                            </Image>
+                            <TextBlock Text="&#9654;" FontSize="18" Foreground="{StaticResource MutedBrush}"
+                                       HorizontalAlignment="Center" VerticalAlignment="Center">
+                                <TextBlock.Style>
+                                    <Style TargetType="TextBlock">
+                                        <Setter Property="Visibility" Value="Collapsed"/>
+                                        <Style.Triggers>
+                                            <DataTrigger Binding="{Binding ThumbnailImageUrl}" Value="{x:Null}">
+                                                <Setter Property="Visibility" Value="Visible"/>
+                                            </DataTrigger>
+                                        </Style.Triggers>
+                                    </Style>
+                                </TextBlock.Style>
+                            </TextBlock>
+                            <ProgressBar Style="{StaticResource FlatProgressBar}" VerticalAlignment="Bottom"
+                                         Value="{Binding Progress, Mode=OneTime}"/>
+                        </Grid>
+                    </Border>
+                    <StackPanel Grid.Column="2" Margin="16,0,0,0" VerticalAlignment="Center">
+                        <DockPanel>
+                            <TextBlock DockPanel.Dock="Right" Text="{Binding DurationLabel}"
+                                       Foreground="{StaticResource MutedBrush}" FontFamily="{StaticResource MonoFont}"
+                                       FontSize="11" Margin="10,0,0,0"/>
+                            <TextBlock Text="{Binding EpisodeRowTitle}" Foreground="{StaticResource TextBrush}"
+                                       FontFamily="{StaticResource SansFont}" FontWeight="SemiBold" FontSize="13"
+                                       TextTrimming="CharacterEllipsis"/>
+                        </DockPanel>
+                        <TextBlock Text="{Binding EpisodeOverview}" Foreground="{StaticResource MutedBrush}"
+                                   FontFamily="{StaticResource SansFont}" FontSize="11.5" LineHeight="16"
+                                   TextWrapping="Wrap" MaxHeight="32" TextTrimming="CharacterEllipsis"
+                                   Margin="0,4,0,0">
+                            <TextBlock.Style>
+                                <Style TargetType="TextBlock">
+                                    <Setter Property="Visibility" Value="Visible"/>
+                                    <Style.Triggers>
+                                        <DataTrigger Binding="{Binding EpisodeOverview}" Value="{x:Null}">
+                                            <Setter Property="Visibility" Value="Collapsed"/>
+                                        </DataTrigger>
+                                    </Style.Triggers>
+                                </Style>
+                            </TextBlock.Style>
+                        </TextBlock>
+                    </StackPanel>
+                </Grid>
+            </DataTemplate>
+
+            <Style x:Key="EpisodeRowListBox" TargetType="ListBox">
                 <Setter Property="Background" Value="Transparent"/>
                 <Setter Property="BorderThickness" Value="0"/>
-                <Setter Property="ItemsPanel" Value="{StaticResource CardWrapPanel}"/>
-                <Setter Property="ItemTemplate" Value="{StaticResource PlaylistCardTemplate}"/>
+                <Setter Property="ItemTemplate" Value="{StaticResource EpisodeRowTemplate}"/>
                 <Setter Property="ScrollViewer.HorizontalScrollBarVisibility" Value="Disabled"/>
                 <Setter Property="ScrollViewer.VerticalScrollBarVisibility" Value="Disabled"/>
-                <Setter Property="Padding" Value="8"/>
                 <Setter Property="ItemContainerStyle">
                     <Setter.Value>
                         <Style TargetType="ListBoxItem">
                             <Setter Property="Background" Value="Transparent"/>
                             <Setter Property="Padding" Value="0"/>
+                            <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
                             <Setter Property="Template">
                                 <Setter.Value>
                                     <ControlTemplate TargetType="ListBoxItem">
@@ -665,6 +1101,42 @@
                         </Style>
                     </Setter.Value>
                 </Setter>
+            </Style>
+
+            <!-- Season tab pill, matching .sv-season-tab/.active. -->
+            <Style x:Key="SeasonTabButton" TargetType="Button">
+                <Setter Property="Background" Value="Transparent"/>
+                <Setter Property="Foreground" Value="{StaticResource MutedBrush}"/>
+                <Setter Property="BorderBrush" Value="{StaticResource BorderBrush2}"/>
+                <Setter Property="BorderThickness" Value="1"/>
+                <Setter Property="FontFamily" Value="{StaticResource MonoFont}"/>
+                <Setter Property="FontSize" Value="11"/>
+                <Setter Property="Padding" Value="12,5"/>
+                <Setter Property="Margin" Value="0,0,8,0"/>
+                <Setter Property="Cursor" Value="Hand"/>
+                <Setter Property="Template">
+                    <Setter.Value>
+                        <ControlTemplate TargetType="Button">
+                            <Border Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}"
+                                    BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="999"
+                                    Padding="{TemplateBinding Padding}">
+                                <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                            </Border>
+                            <ControlTemplate.Triggers>
+                                <Trigger Property="IsMouseOver" Value="True">
+                                    <Setter Property="Foreground" Value="{StaticResource TextBrush}"/>
+                                </Trigger>
+                            </ControlTemplate.Triggers>
+                        </ControlTemplate>
+                    </Setter.Value>
+                </Setter>
+                <Style.Triggers>
+                    <Trigger Property="Tag" Value="Active">
+                        <Setter Property="Background" Value="{StaticResource GoldBrush}"/>
+                        <Setter Property="Foreground" Value="#0A0A0A"/>
+                        <Setter Property="BorderBrush" Value="{StaticResource GoldBrush}"/>
+                    </Trigger>
+                </Style.Triggers>
             </Style>
         </ResourceDictionary>
     </Application.Resources>

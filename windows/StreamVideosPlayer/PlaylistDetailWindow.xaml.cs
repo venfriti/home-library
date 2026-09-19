@@ -40,6 +40,8 @@ public partial class PlaylistDetailWindow : Window
             .ToList();
     }
 
+    private void CloseWindow_Click(object sender, RoutedEventArgs e) => Close();
+
     private async void ItemsList_MouseDoubleClick(object sender, MouseButtonEventArgs e)
     {
         if (ItemsList.SelectedItem is not FileEntry entry) return;

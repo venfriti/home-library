@@ -1,3 +1,4 @@
+using System.IO;
 using System.Net;
 using System.Net.Http;
 using System.Text;
@@ -99,6 +100,35 @@ public class ServerClient
         resp.EnsureSuccessStatusCode();
         var json = await resp.Content.ReadAsStringAsync();
         return JsonSerializer.Deserialize<List<PlaylistDto>>(json) ?? new List<PlaylistDto>();
+    }
+
+    // /playlists/cover requires a real session (see handlePlaylistCover in
+    // main.go) with no LAN bypass equivalent to /local/thumbnail's, so
+    // unlike every other image URL in this app it can't just be handed to
+    // an <Image> as a plain source -- nothing would attach the session
+    // cookie. Fetching the bytes through this client (which already carries
+    // it) and decoding them here is the workaround.
+    public async Task<System.Windows.Media.Imaging.BitmapImage?> GetPlaylistCoverAsync(string id, long updated)
+    {
+        try
+        {
+            using var resp = await SendAuthedAsync(() => new HttpRequestMessage(HttpMethod.Get,
+                $"playlists/cover?id={Uri.EscapeDataString(id)}&v={updated}"));
+            if (!resp.IsSuccessStatusCode) return null;
+            var bytes = await resp.Content.ReadAsByteArrayAsync();
+            using var stream = new MemoryStream(bytes);
+            var image = new System.Windows.Media.Imaging.BitmapImage();
+            image.BeginInit();
+            image.CacheOption = System.Windows.Media.Imaging.BitmapCacheOption.OnLoad;
+            image.StreamSource = stream;
+            image.EndInit();
+            image.Freeze();
+            return image;
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     // Returns null when no release has been published (see

@@ -20,6 +20,7 @@ public partial class MainWindow : Window
     private readonly MediaPlayer _mediaPlayer;
     private readonly DispatcherTimer _uiTimer;
     private readonly DispatcherTimer _progressTimer;
+    private readonly DispatcherTimer _controlsIdleTimer;
     private readonly ObservableCollection<FileEntry> _queue = new();
 
     // Section id -> the StackPanel holding that section's heading + card
@@ -36,10 +37,29 @@ public partial class MainWindow : Window
     private List<FileEntry> _allFiles = new();
     private List<PlaylistDto> _playlists = new();
     private FileEntry? _current;
+    private bool _isMini;
     private bool _isDraggingSlider;
     private bool _useLocalSource;
     private UpdateInfo? _pendingUpdate;
     private readonly AppSettings _settings;
+
+    // Ambient tint (see #tint/bindTint/dominantColour in main.go): the wall
+    // wash resets to this -- the hero's own sampled colour -- whenever
+    // nothing is hovered, rather than back to the plain brand gold every
+    // time. Brand gold (matching CSS's own --tint default) until the hero
+    // actually renders and gets sampled.
+    private System.Windows.Media.Color _restingTintColor =
+        (System.Windows.Media.Color)System.Windows.Media.ColorConverter.ConvertFromString("#9A7D4A")!;
+    private FileEntry? _hoveredTintEntry;
+
+    // Hero rotation (see HERO_WINDOW_MS/heroPick/scheduleHeroRoll in
+    // main.go's frontend JS): the banner holds for a fixed window, then
+    // rerolls to a new (deterministically-picked, not just random) choice
+    // without a full page reload.
+    private const long HeroWindowMs = 6L * 60 * 60 * 1000;
+    private DispatcherTimer? _heroRollTimer;
+    private Border? _heroElement;
+    private readonly Random _heroRandom = new();
 
     public MainWindow(ServerClient client, StoredCredentials creds)
     {
@@ -100,10 +120,25 @@ public partial class MainWindow : Window
         _progressTimer.Tick += async (_, _) => await SaveProgressAsync();
         _progressTimer.Start();
 
+        // Matches showPlayerChrome/idleFadeTimer in main.go's frontend JS:
+        // 3 seconds of no mouse movement over the player fades the chrome
+        // out, any movement brings it back. The web gets the actual video
+        // controls hidden for free from the browser's native <video
+        // controls> idle behavior; this app's whole control bar is
+        // hand-built WPF, so it needs the same idle timer done by hand.
+        _controlsIdleTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(3) };
+        _controlsIdleTimer.Tick += (_, _) =>
+        {
+            _controlsIdleTimer.Stop();
+            SetPlayerControlsVisible(false);
+        };
+
         Closing += async (_, _) =>
         {
             _uiTimer.Stop();
             _progressTimer.Stop();
+            _controlsIdleTimer.Stop();
+            _heroRollTimer?.Stop();
             await SaveProgressAsync();
             _mediaPlayer.Dispose();
             _libVlc.Dispose();
@@ -222,6 +257,7 @@ public partial class MainWindow : Window
                         f.Progress = Math.Clamp(p.Position / p.Duration, 0, 1);
                         f.PositionSeconds = p.Position;
                         f.DurationSeconds = p.Duration;
+                        f.ProgressUpdated = p.Updated;
                     }
                 }
             }
@@ -267,17 +303,125 @@ public partial class MainWindow : Window
             ? src.ToList()
             : src.Where(f => f.DisplayTitle.Contains(term, StringComparison.OrdinalIgnoreCase)).ToList();
 
-        var continueWatching = Filter(_allFiles.Where(f => f.Progress > 0)).Take(7).ToList();
-        AddHeroBanner(continueWatching.FirstOrDefault() ?? _allFiles.FirstOrDefault());
-        AddFileSection("rail-continue-watching", "Continue watching", continueWatching, wide: true);
-        AddFileSection("rail-films", "Films", Filter(_allFiles.Where(f => f.Section == ContentSection.Film)), wide: false);
-        AddFileSection("rail-series", "Series", Filter(_allFiles.Where(f => f.Section == ContentSection.Series)), wide: false);
+        var continueWatching = ContinueWatchingItems(Filter(_allFiles.Where(f => f.Progress > 0)));
+        // Hero picking uses the unfiltered library (matching heroCandidates
+        // taking the full file list in main.go, not whatever a search term
+        // narrows the wall down to) -- a hero disappearing or jumping around
+        // while typing a search would be a worse experience than just
+        // holding still.
+        _heroElement = AddHeroBanner(PickHero());
+        if (_heroElement is not null) SectionsPanel.Children.Add(_heroElement);
+        ScheduleHeroRoll();
+        AddFileSection("rail-continue-watching", "Continue watching", continueWatching, "ContinueWatchingCardListBox");
+        AddFileSection("rail-films", "Films", Filter(_allFiles.Where(f => f.Section == ContentSection.Film)), "CardListBox");
+        AddSeriesSection(Filter(_allFiles.Where(f => f.Section == ContentSection.Series)));
         AddPlaylistsSection();
-        AddFileSection("rail-music", "Music videos", Filter(_allFiles.Where(f => f.Section == ContentSection.MusicVideo)), wide: true);
-        AddFileSection("rail-library", "Library", Filter(_allFiles.Where(f => f.Section == ContentSection.Library)), wide: true);
+        AddFileSection("rail-music", "Music videos", Filter(_allFiles.Where(f => f.Section == ContentSection.MusicVideo)), "MusicVideoCardListBox");
+        // Library mirrors #other-grid on the web -- the same 2:3 poster grid
+        // as Films/Series, not a wide 16:9 one; unmatched files just get
+        // whatever art they have cropped into that shape, same as there.
+        AddFileSection("rail-library", "Library", Filter(_allFiles.Where(f => f.Section == ContentSection.Library)), "CardListBox");
 
         if (_sectionTagButtons.Count > 0)
             SetActiveSectionTag(_sectionTagButtons.Keys.First());
+    }
+
+    // Mirrors continueItems() in main.go's frontend JS exactly: sorted by
+    // recency (most recently saved progress first, not whatever order the
+    // catalog lists files in), with music videos capped at 4 anywhere in the
+    // row -- applied here, before the row's own 8-item limit, so a movie or
+    // episode just past a 5th music video gets pulled up into contention
+    // rather than losing its slot to it. A binge of short music videos would
+    // otherwise crowd out every slot in the row that actually exists to
+    // surface progress on shows and movies.
+    private static List<FileEntry> ContinueWatchingItems(IEnumerable<FileEntry> src)
+    {
+        var sorted = src.OrderByDescending(f => f.ProgressUpdated);
+        var musicSeen = 0;
+        var result = new List<FileEntry>();
+        foreach (var f in sorted)
+        {
+            if (f.IsMusicVideo)
+            {
+                musicSeen++;
+                if (musicSeen > 4) continue;
+            }
+            result.Add(f);
+            if (result.Count == 8) break;
+        }
+        return result;
+    }
+
+    // Matches heroCandidates/heroPick/pickHeroFilm in main.go's frontend JS:
+    // prefer a movie/show from Continue Watching (stable within a 6-hour
+    // window, scrambled between windows, never a music video -- the banner
+    // is for something part-way through, not a 3-minute clip), falling back
+    // to a random movie with usable art, then anything with usable art at
+    // all, when there's nothing to resume.
+    private FileEntry? PickHero()
+    {
+        var continueWatchingUnfiltered = ContinueWatchingItems(_allFiles.Where(f => f.Progress > 0));
+        var candidates = continueWatchingUnfiltered
+            .Where(f => (f.MediaType == "movie" || f.MediaType == "tv") && !string.IsNullOrEmpty(f.HeroArt))
+            .Take(5)
+            .ToList();
+        if (candidates.Count > 0)
+        {
+            var windowIdx = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() / HeroWindowMs;
+            var picked = HeroPick(candidates, windowIdx);
+            if (picked is not null) return picked;
+        }
+
+        // pickHeroFilm's own "standalone" pool: not a tv item grouped into a
+        // show (see groupBySeries -- tv with a real tmdb_id).
+        var standalone = _allFiles.Where(f => !(f.MediaType == "tv" && f.TmdbId > 0)).ToList();
+        var pool = standalone.Where(f => f.MediaType == "movie" && !string.IsNullOrEmpty(f.HeroArt)).ToList();
+        if (pool.Count == 0) pool = standalone.Where(f => !string.IsNullOrEmpty(f.HeroArt)).ToList();
+        return pool.Count > 0 ? pool[_heroRandom.Next(pool.Count)] : null;
+    }
+
+    // A faithful-in-spirit, not bit-identical, port of heroPick's xorshift-
+    // style mix: JS fakes 32-bit integer ops via bitwise operators on
+    // doubles, C# just uses real unsigned 32-bit arithmetic -- same
+    // multiplier constants, same "stable within a window, scrambled between
+    // windows" property, different exact numbers.
+    private static FileEntry? HeroPick(List<FileEntry> candidates, long windowIdx)
+    {
+        if (candidates.Count == 0) return null;
+        unchecked
+        {
+            var h = (uint)((windowIdx + 1) * 2654435761L);
+            h ^= h >> 13;
+            h *= 1274126177u;
+            h ^= h >> 16;
+            return candidates[(int)(h % (uint)candidates.Count)];
+        }
+    }
+
+    // Matches scheduleHeroRoll: fires exactly at the next window boundary
+    // (not just "every 6 hours" from whenever the app happened to launch),
+    // so a screen left running lines up with the same reroll moment the web
+    // would.
+    private void ScheduleHeroRoll()
+    {
+        _heroRollTimer?.Stop();
+        var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        var wait = HeroWindowMs - (now % HeroWindowMs) + 1000;
+        _heroRollTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(wait) };
+        _heroRollTimer.Tick += (_, _) =>
+        {
+            _heroRollTimer!.Stop();
+            RerollHero();
+        };
+        _heroRollTimer.Start();
+    }
+
+    private void RerollHero()
+    {
+        if (_heroElement is not null) SectionsPanel.Children.Remove(_heroElement);
+        _heroElement = AddHeroBanner(PickHero());
+        if (_heroElement is not null) SectionsPanel.Children.Insert(0, _heroElement);
+        ScheduleHeroRoll();
     }
 
     // Big backdrop banner at the top of the page, matching the web's actual
@@ -287,11 +431,16 @@ public partial class MainWindow : Window
     // mono kicker line, a serif title, a 2-line-clamped description, and a
     // solid-gold play/resume button -- not the plain single-gradient banner
     // this used to be.
-    private void AddHeroBanner(FileEntry? hero)
+    private Border? AddHeroBanner(FileEntry? hero)
     {
-        if (hero is null) return;
+        if (hero is null) return null;
         var imageUrl = hero.HeroArt;
-        if (string.IsNullOrEmpty(imageUrl)) return;
+        if (string.IsNullOrEmpty(imageUrl)) return null;
+
+        // tintDefault in main.go's own updateHero: the wall tint settles
+        // back to the hero's own colour on mouseleave, not the plain brand
+        // gold, once it's actually available.
+        _ = SampleAndSetRestingTintAsync(imageUrl);
 
         var resuming = hero.Progress > 0 && !string.IsNullOrEmpty(hero.RemainingLabel);
 
@@ -380,7 +529,7 @@ public partial class MainWindow : Window
         info.Children.Add(playButton);
 
         grid.Children.Add(info);
-        SectionsPanel.Children.Add(container);
+        return container;
     }
 
     // Matches renderHero's own kicker composition: "Resume · 1h 32m left"
@@ -461,33 +610,96 @@ public partial class MainWindow : Window
         return grid;
     }
 
-    private void AddFileSection(string id, string label, List<FileEntry> items, bool wide)
+    private void AddFileSection(string id, string label, List<FileEntry> items, string listStyleKey)
     {
         if (items.Count == 0) return;
 
         var panel = new StackPanel();
         panel.Children.Add(BuildRailHead(label, items.Count));
 
-        // Continue watching gets its own template (permanent below-image
-        // caption + time-left, matching .cw-shot/.cw-meta) rather than the
-        // generic hover-reveal wide card the other wide sections use.
-        var styleKey = id == "rail-continue-watching" ? "ContinueWatchingCardListBox" : (wide ? "WideCardListBox" : "CardListBox");
         var listBox = new ListBox
         {
-            Style = (Style)FindResource(styleKey),
+            Style = (Style)FindResource(listStyleKey),
             ItemsSource = items,
         };
-        listBox.MouseDoubleClick += async (_, _) =>
+        // Every real card on the web opens on a single click (renderFileCard/
+        // renderContinueCard/renderMusicCard all wire a plain 'click'
+        // listener, not a double-click) -- MouseDoubleClick here was a WPF
+        // ListBox convention nobody had actually checked against the site.
+        // The overflow button is the one exception: AttachCardMoreMenu below
+        // already marks that click Handled, but Preview tunnels down before
+        // that bubble-phase handling runs, so it still needs its own
+        // exclusion here to avoid also starting playback.
+        //
+        // Films are a second exception: openFile in main.go only plays a
+        // movie directly when the caller explicitly passes skipDetailCheck
+        // (Continue Watching, the hero's Resume button, a context menu's
+        // Play) -- a plain click on a Films-rail card opens the detail page
+        // instead. Every other section here (Continue Watching/Music/
+        // Library) genuinely does play on a plain click on the real site.
+        var isFilmsRail = id == "rail-films";
+        listBox.PreviewMouseLeftButtonUp += async (_, e) =>
         {
-            if (listBox.SelectedItem is FileEntry entry) await PlayAsync(entry);
+            var source = e.OriginalSource as DependencyObject;
+            if (FindAncestor<Button>(source) is { Name: "CardMoreButton" }) return;
+            var item = FindAncestor<ListBoxItem>(source);
+            if (item?.DataContext is not FileEntry entry) return;
+            if (isFilmsRail) OpenFilmDetail(entry);
+            else await PlayAsync(entry);
         };
+        AttachHoverTint(listBox);
         AttachCardMoreMenu(listBox);
         AttachWheelForwarding(listBox);
+        AttachDragSource(listBox);
         panel.Children.Add(listBox);
 
         SectionsPanel.Children.Add(panel);
         _sectionElements[id] = panel;
         AddSectionTag(id, label, items.Count);
+    }
+
+    // Mirrors groupBySeries in main.go's frontend JS: the Series rail is one
+    // tile per show, not one per episode -- an unmatched episode (no
+    // tmdb_id) still gets its own one-episode "show" tile rather than
+    // silently disappearing, since there's nothing else to group it under.
+    private void AddSeriesSection(List<FileEntry> episodes)
+    {
+        if (episodes.Count == 0) return;
+
+        var shows = episodes
+            .GroupBy(f => f.TmdbId > 0 ? f.TmdbId : -f.GetHashCode())
+            .Select(g => new ShowGroup(g.Key, g.ToList()))
+            .OrderBy(s => s.DisplayTitle, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        var panel = new StackPanel();
+        panel.Children.Add(BuildRailHead("Series", shows.Count));
+
+        var listBox = new ListBox { Style = (Style)FindResource("ShowCardListBox"), ItemsSource = shows };
+        listBox.PreviewMouseLeftButtonUp += (_, e) =>
+        {
+            var item = FindAncestor<ListBoxItem>(e.OriginalSource as DependencyObject);
+            if (item?.DataContext is ShowGroup show) OpenShowDetail(show);
+        };
+        AttachWheelForwarding(listBox);
+        panel.Children.Add(listBox);
+
+        SectionsPanel.Children.Add(panel);
+        _sectionElements["rail-series"] = panel;
+        AddSectionTag("rail-series", "Series", shows.Count);
+    }
+
+    private void OpenShowDetail(ShowGroup show)
+    {
+        var win = new ShowDetailWindow(show, PlayAsync) { Owner = this };
+        win.ShowDialog();
+    }
+
+    private void OpenFilmDetail(FileEntry film)
+    {
+        var extras = _allFiles.Where(f => f.IsExtra && f.MainKey == film.Key).ToList();
+        var win = new FilmDetailWindow(film, extras, PlayAsync) { Owner = this };
+        win.ShowDialog();
     }
 
     private void AddPlaylistsSection()
@@ -504,17 +716,67 @@ public partial class MainWindow : Window
         // via direct hit-testing rather than relying on ListBox.SelectedItem
         // timing -- simpler and more reliably "just works" than a
         // double-click, which was reported as sometimes not opening at all.
+        // The card's own play button (.pl-play on the web) is the one
+        // exception -- it starts playback directly instead of opening the
+        // detail window, matching startPlay's stopPropagation there.
         listBox.PreviewMouseLeftButtonUp += (_, e) =>
         {
-            var item = FindAncestor<ListBoxItem>(e.OriginalSource as DependencyObject);
-            if (item?.DataContext is PlaylistDto playlist) OpenPlaylistDetail(playlist);
+            var source = e.OriginalSource as DependencyObject;
+            var item = FindAncestor<ListBoxItem>(source);
+            if (item?.DataContext is not PlaylistDto playlist) return;
+
+            if (FindAncestor<Button>(source) is { Name: "PlayButton" })
+            {
+                e.Handled = true;
+                _ = PlayFirstInPlaylistAsync(playlist);
+                return;
+            }
+            OpenPlaylistDetail(playlist);
         };
         AttachWheelForwarding(listBox);
+
+        // Matches wirePlaylistDropTarget's drop side: a file card dragged
+        // from AttachDragSource lands here, resolved to whichever playlist
+        // tile is actually under the cursor.
+        listBox.AllowDrop = true;
+        listBox.DragOver += (_, e) =>
+        {
+            e.Effects = e.Data.GetDataPresent(DragFileKeyFormat) ? DragDropEffects.Copy : DragDropEffects.None;
+            e.Handled = true;
+        };
+        listBox.Drop += async (_, e) =>
+        {
+            if (!e.Data.GetDataPresent(DragFileKeyFormat)) return;
+            var item = FindAncestor<ListBoxItem>(e.OriginalSource as DependencyObject);
+            if (item?.DataContext is not PlaylistDto playlist) return;
+            var key = (string)e.Data.GetData(DragFileKeyFormat)!;
+            try
+            {
+                await _client.AddToPlaylistAsync(playlist.Id, key);
+                await LoadPlaylistsAsync();
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Couldn't add to playlist: {ex.Message}", "Stream",
+                    MessageBoxButton.OK, MessageBoxImage.Warning);
+            }
+        };
+
         panel.Children.Add(listBox);
 
         SectionsPanel.Children.Add(panel);
         _sectionElements["rail-playlists"] = panel;
         AddSectionTag("rail-playlists", "Playlists", _playlists.Count);
+    }
+
+    // Matches the web's startPlay: the first still-resolvable item in
+    // playlist order (a member since removed from the library is skipped
+    // rather than blocking playback of everything after it).
+    private async Task PlayFirstInPlaylistAsync(PlaylistDto playlist)
+    {
+        var byKey = _allFiles.ToDictionary(f => f.Key);
+        var first = playlist.Items.Select(k => byKey.GetValueOrDefault(k)).FirstOrDefault(f => f is not null);
+        if (first is not null) await PlayAsync(first);
     }
 
     private void OpenPlaylistDetail(PlaylistDto playlist)
@@ -595,7 +857,15 @@ public partial class MainWindow : Window
             if (fe.DataContext is not FileEntry entry) return;
             e.Handled = true;
 
+            // Matches openCtxMenu's own row set (Play/Play next/Add to
+            // queue/Add to playlist): "Play" always plays directly
+            // (skipDetailCheck there), bypassing the Films-rail detail-page
+            // click behavior on purpose, same as the web's own menu does.
             var menu = new ContextMenu();
+            var playItem = new MenuItem { Header = "Play" };
+            playItem.Click += async (_, _) => await PlayAsync(entry);
+            var playNextItem = new MenuItem { Header = "Play Next" };
+            playNextItem.Click += (_, _) => _queue.Insert(0, entry);
             var queueItem = new MenuItem { Header = "Add to Queue" };
             queueItem.Click += (_, _) => _queue.Add(entry);
             var playlistItem = new MenuItem { Header = "Add to Playlist…" };
@@ -604,6 +874,8 @@ public partial class MainWindow : Window
                 var dialog = new AddToPlaylistWindow(_client, entry.Key) { Owner = this };
                 if (dialog.ShowDialog() == true) _ = LoadPlaylistsAsync();
             };
+            menu.Items.Add(playItem);
+            menu.Items.Add(playNextItem);
             menu.Items.Add(queueItem);
             menu.Items.Add(playlistItem);
             menu.PlacementTarget = fe;
@@ -611,9 +883,9 @@ public partial class MainWindow : Window
         }), true);
     }
 
-    // A ListBox's own ScrollViewer is disabled (see CardListBox/
-    // WideCardListBox), but a nested ItemsControl still captures the mouse
-    // wheel for itself rather than letting it bubble to the page's outer
+    // A ListBox's own ScrollViewer is disabled (see CardListBox and its
+    // variants), but a nested ItemsControl still captures the mouse wheel
+    // for itself rather than letting it bubble to the page's outer
     // ScrollViewer -- a well-known WPF quirk, and the reason scrolling over
     // any card section didn't work. Forwarding it by hand fixes that.
     private void AttachWheelForwarding(ListBox listBox)
@@ -623,6 +895,90 @@ public partial class MainWindow : Window
             MainScroll.ScrollToVerticalOffset(MainScroll.VerticalOffset - e.Delta);
             e.Handled = true;
         };
+    }
+
+    // Matches wirePlaylistDropTarget's drag side in main.go's frontend JS
+    // (see renderMusicCard's own dragstart wiring): any file card can be
+    // dragged onto a playlist tile to add it, mouse/trackpad only, same as
+    // there (HTML5 drag-and-drop has no touch equivalent either). Standard
+    // WPF drag-detection pattern: a real drag only starts once the mouse has
+    // moved past the OS's own drag threshold while still held, so a plain
+    // click still reaches the PreviewMouseLeftButtonUp handler that opens/
+    // plays the card -- DoDragDrop's own nested message loop consumes the
+    // eventual mouse-up when a drag genuinely happened, so the two never
+    // both fire for the same gesture.
+    private static void AttachDragSource(ListBox listBox)
+    {
+        Point? dragStart = null;
+        listBox.PreviewMouseLeftButtonDown += (_, e) => dragStart = e.GetPosition(null);
+        listBox.PreviewMouseMove += (_, e) =>
+        {
+            if (dragStart is not { } start || e.LeftButton != MouseButtonState.Pressed) return;
+            var pos = e.GetPosition(null);
+            if (Math.Abs(pos.X - start.X) < SystemParameters.MinimumHorizontalDragDistance &&
+                Math.Abs(pos.Y - start.Y) < SystemParameters.MinimumVerticalDragDistance) return;
+            dragStart = null;
+
+            var item = FindAncestor<ListBoxItem>(e.OriginalSource as DependencyObject);
+            if (item?.DataContext is not FileEntry entry) return;
+            DragDrop.DoDragDrop(item, new DataObject(DragFileKeyFormat, entry.Key), DragDropEffects.Copy);
+        };
+    }
+
+    private const string DragFileKeyFormat = "StreamVideosPlayer.FileEntryKey";
+
+    // Matches bindTint's mouseenter/mouseleave pairing in main.go's frontend
+    // JS, adapted to WPF: MouseEnter/MouseLeave are Direct-routed (no
+    // bubbling), so there's no way to catch them for dynamically-generated
+    // children from a single handler on the ListBox the way Click/wheel
+    // events above are handled. MouseMove (which does bubble) plus hit-
+    // testing the currently-covered ListBoxItem, only acting when it
+    // actually changed, is the standard substitute.
+    private void AttachHoverTint(ListBox listBox)
+    {
+        listBox.MouseMove += (_, e) =>
+        {
+            var item = FindAncestor<ListBoxItem>(e.OriginalSource as DependencyObject);
+            var entry = item?.DataContext as FileEntry;
+            if (ReferenceEquals(entry, _hoveredTintEntry)) return;
+            _hoveredTintEntry = entry;
+            _ = UpdateWallTintAsync(entry?.CardImageUrl ?? entry?.ThumbnailImageUrl);
+        };
+        listBox.MouseLeave += (_, _) =>
+        {
+            _hoveredTintEntry = null;
+            _ = UpdateWallTintAsync(null);
+        };
+    }
+
+    private async Task SampleAndSetRestingTintAsync(string imageUrl)
+    {
+        var color = await ColorSampler.SampleFromUrlAsync(imageUrl);
+        if (color is null) return;
+        _restingTintColor = color.Value;
+        // Nothing hovered right now -- the wash should already be showing
+        // the hero's colour at rest, not waiting for the first mouseleave
+        // to ever apply it.
+        if (_hoveredTintEntry is null) AnimateTintBrush(WallTintBrush, _restingTintColor);
+    }
+
+    // Matches applyTint/tintReset: url null means "nothing hovered", which
+    // settles back to _restingTintColor (the hero's own sampled colour, set
+    // once in AddHeroBanner) rather than the plain brand gold every time.
+    private async Task UpdateWallTintAsync(string? url)
+    {
+        var color = url is null ? _restingTintColor : await ColorSampler.SampleFromUrlAsync(url) ?? _restingTintColor;
+        AnimateTintBrush(WallTintBrush, color);
+    }
+
+    // Matches #tint's own transition:background 420ms cubic-bezier(.4,0,.2,1).
+    private static void AnimateTintBrush(System.Windows.Media.SolidColorBrush brush, System.Windows.Media.Color to)
+    {
+        var animation = new System.Windows.Media.Animation.ColorAnimation(to, TimeSpan.FromMilliseconds(420))
+        {
+            EasingFunction = new System.Windows.Media.Animation.CubicEase { EasingMode = System.Windows.Media.Animation.EasingMode.EaseOut },
+        };
+        brush.BeginAnimation(System.Windows.Media.SolidColorBrush.ColorProperty, animation);
     }
 
     private static T? FindAncestor<T>(DependencyObject? current) where T : DependencyObject
@@ -639,6 +995,14 @@ public partial class MainWindow : Window
         try
         {
             _playlists = await _client.GetPlaylistsAsync();
+            // Fetched (and bound) before RebuildSections runs, same
+            // convention as FileEntry.Progress -- plain settable properties
+            // populated once up front rather than raising change
+            // notifications after the ListBox has already bound.
+            await Task.WhenAll(_playlists.Where(p => p.Items.Count > 0).Select(async p =>
+            {
+                p.CoverImage = await _client.GetPlaylistCoverAsync(p.Id, p.Updated);
+            }));
             RebuildSections();
         }
         catch (Exception ex)
@@ -671,13 +1035,25 @@ public partial class MainWindow : Window
         if (!string.IsNullOrEmpty(entry.SubtitleUrl))
             media.AddOption(":sub-file=" + entry.SubtitleUrl);
 
-        var resume = await _client.GetProgressAsync(entry.Key);
-        if (resume is { Position: > 0 })
-            media.AddOption($":start-time={(int)resume.Position}");
+        // Matches resumePlayback's own fromStart rule in main.go's frontend
+        // JS: a music video is a few minutes long and gets rewatched, not
+        // continued, so it always opens at the start even though progress is
+        // still recorded for it (still drives the Continue Watching row and
+        // its own progress bar -- only the seek-on-open is skipped).
+        if (!entry.IsMusicVideo)
+        {
+            var resume = await _client.GetProgressAsync(entry.Key);
+            if (resume is { Position: > 0 })
+                media.AddOption($":start-time={(int)resume.Position}");
+        }
 
         _current = entry;
         NowPlayingText.Text = entry.DisplayTitle;
         PlayerOverlay.Visibility = Visibility.Visible;
+        SetPlayerControlsVisible(true);
+        _controlsIdleTimer.Stop();
+        _controlsIdleTimer.Start();
+        StartPlayerTint(entry);
         _mediaPlayer.Play(media);
     }
 
@@ -685,7 +1061,139 @@ public partial class MainWindow : Window
     {
         await SaveProgressAsync();
         _mediaPlayer.Stop();
+        _controlsIdleTimer.Stop();
+        StopPlayerTint();
         PlayerOverlay.Visibility = Visibility.Collapsed;
+        // Only reachable from the full-size layout (the close button lives
+        // in BackButtonBar, which minimizing hides -- restore first is the
+        // only path back to it), but reset defensively so the next PlayAsync
+        // always opens full-size regardless.
+        if (_isMini) RestorePlayer();
+    }
+
+    // Matches setNowPlayingTint/updateNowPlayingWash in main.go's frontend
+    // JS, just always-on for the whole time a video is open rather than
+    // gated on the minimized mini-player's own queue state -- there's no
+    // wall showing through here to reserve the effect for (see #modal's own
+    // CSS comment making the same call).
+    private void StartPlayerTint(FileEntry entry)
+    {
+        var art = entry.CardImageUrl ?? entry.ThumbnailImageUrl ?? entry.HeroArt;
+        _ = SampleAndSetPlayerTintAsync(art);
+
+        var breathe = new System.Windows.Media.Animation.DoubleAnimation(0.28, 0.5, TimeSpan.FromSeconds(8))
+        {
+            AutoReverse = true,
+            RepeatBehavior = System.Windows.Media.Animation.RepeatBehavior.Forever,
+            EasingFunction = new System.Windows.Media.Animation.SineEase(),
+        };
+        PlayerTint.BeginAnimation(UIElement.OpacityProperty, breathe);
+
+        // Independent, non-matching durations for X vs Y (13s/17s) so the
+        // drift never quite repeats the same beat twice -- same reasoning
+        // main.go gives for its own wash's opacity/path timing mismatch.
+        var driftX = new System.Windows.Media.Animation.DoubleAnimation(-40, 40, TimeSpan.FromSeconds(13))
+        {
+            AutoReverse = true,
+            RepeatBehavior = System.Windows.Media.Animation.RepeatBehavior.Forever,
+            EasingFunction = new System.Windows.Media.Animation.SineEase(),
+        };
+        var driftY = new System.Windows.Media.Animation.DoubleAnimation(-25, 25, TimeSpan.FromSeconds(17))
+        {
+            AutoReverse = true,
+            RepeatBehavior = System.Windows.Media.Animation.RepeatBehavior.Forever,
+            EasingFunction = new System.Windows.Media.Animation.SineEase(),
+        };
+        PlayerTintDrift.BeginAnimation(System.Windows.Media.TranslateTransform.XProperty, driftX);
+        PlayerTintDrift.BeginAnimation(System.Windows.Media.TranslateTransform.YProperty, driftY);
+    }
+
+    private void StopPlayerTint()
+    {
+        PlayerTint.BeginAnimation(UIElement.OpacityProperty, null);
+        PlayerTintDrift.BeginAnimation(System.Windows.Media.TranslateTransform.XProperty, null);
+        PlayerTintDrift.BeginAnimation(System.Windows.Media.TranslateTransform.YProperty, null);
+    }
+
+    private async Task SampleAndSetPlayerTintAsync(string? art)
+    {
+        var color = art is null ? null : await ColorSampler.SampleFromUrlAsync(art);
+        AnimateTintBrush(PlayerTintBrush, color ?? _restingTintColor);
+    }
+
+    private void PlayerOverlay_MouseMove(object sender, MouseEventArgs e)
+    {
+        if (_isMini) return; // no chrome to fade in the mini box -- see MinimizePlayer
+        SetPlayerControlsVisible(true);
+        _controlsIdleTimer.Stop();
+        _controlsIdleTimer.Start();
+    }
+
+    // Matches modalTap's own click handler: clicking the mini box restores
+    // it to full size, rather than doing anything else with the click.
+    private void PlayerOverlay_MouseLeftButtonUp(object sender, MouseButtonEventArgs e)
+    {
+        if (_isMini) RestorePlayer();
+    }
+
+    // Matches minimizePlayer/restorePlayer in main.go's frontend JS: shrinks
+    // PlayerOverlay itself down to a small corner box rather than punching
+    // an interactive hole through a full-window overlay -- a WPF element
+    // only occupies and hit-tests its own rendered bounds, so once
+    // PlayerOverlay is sized and anchored to a small corner rect instead of
+    // stretched to fill the window, clicks everywhere else already fall
+    // through to BrowseRoot underneath with no extra plumbing needed.
+    private void MinimizePlayer_Click(object sender, RoutedEventArgs e) => MinimizePlayer();
+
+    private void MinimizePlayer()
+    {
+        _isMini = true;
+        _controlsIdleTimer.Stop();
+        PlayerOverlay.Background = System.Windows.Media.Brushes.Transparent;
+        PlayerOverlay.HorizontalAlignment = HorizontalAlignment.Right;
+        PlayerOverlay.VerticalAlignment = VerticalAlignment.Bottom;
+        PlayerOverlay.Width = 340;
+        PlayerOverlay.Height = 191;
+        PlayerOverlay.Margin = new Thickness(0, 0, 16, 16);
+        PlayerTint.Visibility = Visibility.Collapsed;
+        PlayerFrame.Margin = new Thickness(0);
+        BackButtonBar.Visibility = Visibility.Collapsed;
+        ControlsBar.Visibility = Visibility.Collapsed;
+    }
+
+    private void RestorePlayer()
+    {
+        _isMini = false;
+        PlayerOverlay.Background = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromArgb(0xD2, 0, 0, 0));
+        PlayerOverlay.HorizontalAlignment = HorizontalAlignment.Stretch;
+        PlayerOverlay.VerticalAlignment = VerticalAlignment.Stretch;
+        PlayerOverlay.Width = double.NaN;
+        PlayerOverlay.Height = double.NaN;
+        PlayerOverlay.Margin = new Thickness(0);
+        PlayerTint.Visibility = Visibility.Visible;
+        PlayerFrame.Margin = new Thickness(56);
+        BackButtonBar.Visibility = Visibility.Visible;
+        ControlsBar.Visibility = Visibility.Visible;
+        SetPlayerControlsVisible(true);
+        _controlsIdleTimer.Stop();
+        _controlsIdleTimer.Start();
+    }
+
+    // Fades the back button and the whole control bar (not the video itself,
+    // which lives in its own Grid row and is never touched) -- Opacity +
+    // IsHitTestVisible rather than Visibility=Collapsed, since collapsing an
+    // Auto-height row would let the VideoView's Grid.Row="1" (Height="*")
+    // expand into the freed space, resizing the video every time the
+    // controls hide/show. Matches the web's own .chrome-off, which uses
+    // opacity+pointer-events for exactly this reason (see main.go's CSS).
+    private void SetPlayerControlsVisible(bool visible)
+    {
+        var opacity = visible ? 1.0 : 0.0;
+        BackButtonBar.Opacity = opacity;
+        BackButtonBar.IsHitTestVisible = visible;
+        ControlsBar.Opacity = opacity;
+        ControlsBar.IsHitTestVisible = visible;
+        if (!visible) SettingsPopup.IsOpen = false;
     }
 
     private void PlayPause_Click(object sender, RoutedEventArgs e)

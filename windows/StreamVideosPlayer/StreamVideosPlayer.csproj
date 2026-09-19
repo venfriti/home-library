@@ -31,6 +31,13 @@
     <!-- Also embedded as a WPF resource so Window.Icon="app.ico" resolves at
          runtime (ApplicationIcon above only sets the .exe's own icon). -->
     <Resource Include="app.ico" />
+    <!-- Pre-dithered gradient-shape masks for the ambient tint system (see
+         ColorSampler.cs and MainWindow's tint wiring): dithering is baked
+         in at authoring time rather than left to WPF's own live gradient
+         brushes, which band visibly on a wide, low-contrast fade over a
+         near-black background: exactly the shape these are. -->
+    <Resource Include="Assets\tint-wall-mask.png" />
+    <Resource Include="Assets\tint-player-mask.png" />
   </ItemGroup>
 
 </Project>

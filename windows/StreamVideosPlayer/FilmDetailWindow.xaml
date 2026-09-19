@@ -1,0 +1,32 @@
+<Window x:Class="StreamVideosPlayer.FilmDetailWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:shell="clr-namespace:System.Windows.Shell;assembly=PresentationFramework"
+        Title="Film" Height="760" Width="980" Icon="app.ico"
+        Background="{StaticResource BgBrush}" FontFamily="{StaticResource SansFont}"
+        WindowStartupLocation="CenterOwner" WindowStyle="None" ResizeMode="CanResize">
+    <!-- Mirrors renderMovieView in main.go's frontend JS: on the real site, a
+         plain click on a Films-rail card opens THIS (a detail page), not
+         playback directly: openFile only skips straight to playing when
+         the caller explicitly passes skipDetailCheck (Continue Watching,
+         the hero's own Resume button, a context menu's "Play"). Same dark
+         title bar as the other detail windows, for the same reason. -->
+    <shell:WindowChrome.WindowChrome>
+        <shell:WindowChrome CaptionHeight="36" ResizeBorderThickness="5" GlassFrameThickness="0" CornerRadius="0"/>
+    </shell:WindowChrome.WindowChrome>
+    <DockPanel>
+        <Border DockPanel.Dock="Top" Height="36" Background="{StaticResource BgBrush}">
+            <DockPanel LastChildFill="False">
+                <TextBlock DockPanel.Dock="Left" Text="Film" Foreground="{StaticResource MutedBrush}"
+                           FontFamily="{StaticResource MonoFont}" FontSize="11" Margin="14,0"
+                           VerticalAlignment="Center"/>
+                <Button DockPanel.Dock="Right" Content="&#xE8BB;" Style="{StaticResource TitleBarCloseButton}"
+                        Click="CloseWindow_Click" shell:WindowChrome.IsHitTestVisibleInChrome="True"/>
+            </DockPanel>
+        </Border>
+
+        <ScrollViewer VerticalScrollBarVisibility="Auto">
+            <StackPanel x:Name="ContentPanel" Margin="0,0,0,28"/>
+        </ScrollViewer>
+    </DockPanel>
+</Window>

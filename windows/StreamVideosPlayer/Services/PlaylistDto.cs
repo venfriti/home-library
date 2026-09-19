@@ -19,6 +19,13 @@ public class PlaylistDto
 
     [JsonPropertyName("updated")]
     public long Updated { get; set; }
+
+    // Populated by MainWindow.LoadPlaylistsAsync via
+    // ServerClient.GetPlaylistCoverAsync, not part of the /playlists JSON
+    // itself -- null for an empty playlist (nothing to compose a cover
+    // from) or a failed fetch, matching .pl-empty's "no cover" state on the
+    // web either way.
+    public System.Windows.Media.Imaging.BitmapImage? CoverImage { get; set; }
 }
 
 // Body shape for POST /playlists -- action selects which fields matter (see

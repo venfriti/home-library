@@ -1,0 +1,31 @@
+<Window x:Class="StreamVideosPlayer.ShowDetailWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:shell="clr-namespace:System.Windows.Shell;assembly=PresentationFramework"
+        Title="Series" Height="760" Width="980" Icon="app.ico"
+        Background="{StaticResource BgBrush}" FontFamily="{StaticResource SansFont}"
+        WindowStartupLocation="CenterOwner" WindowStyle="None" ResizeMode="CanResize">
+    <!-- Mirrors renderShowView in main.go's frontend JS: backdrop + poster
+         header (same "cinematic hero" layout the movie detail page uses),
+         season tabs when the show has more than one season, and a numbered
+         episode list for whichever season is selected. Same dark title bar
+         as the other detail windows. -->
+    <shell:WindowChrome.WindowChrome>
+        <shell:WindowChrome CaptionHeight="36" ResizeBorderThickness="5" GlassFrameThickness="0" CornerRadius="0"/>
+    </shell:WindowChrome.WindowChrome>
+    <DockPanel>
+        <Border DockPanel.Dock="Top" Height="36" Background="{StaticResource BgBrush}">
+            <DockPanel LastChildFill="False">
+                <TextBlock DockPanel.Dock="Left" Text="Series" Foreground="{StaticResource MutedBrush}"
+                           FontFamily="{StaticResource MonoFont}" FontSize="11" Margin="14,0"
+                           VerticalAlignment="Center"/>
+                <Button DockPanel.Dock="Right" Content="&#xE8BB;" Style="{StaticResource TitleBarCloseButton}"
+                        Click="CloseWindow_Click" shell:WindowChrome.IsHitTestVisibleInChrome="True"/>
+            </DockPanel>
+        </Border>
+
+        <ScrollViewer VerticalScrollBarVisibility="Auto">
+            <StackPanel x:Name="ContentPanel" Margin="0,0,0,28"/>
+        </ScrollViewer>
+    </DockPanel>
+</Window>

@@ -44,22 +44,31 @@
 
         <Grid>
             <!-- Browse layer -->
-            <Grid x:Name="BrowseRoot">
-                <Grid.Background>
-                    <!-- The site washes the top of the page in a soft gold glow
-                         (a radial gradient tinted with the site's gold accent
-                         color) over the black background; this reproduces
-                         that same atmosphere. -->
-                    <RadialGradientBrush Center="0.5,0" RadiusX="0.9" RadiusY="0.6" GradientOrigin="0.5,0">
-                        <GradientStop Color="#3D9A7D4A" Offset="0"/>
-                        <GradientStop Color="#000A0A0A" Offset="1"/>
-                    </RadialGradientBrush>
-                </Grid.Background>
+            <Grid x:Name="BrowseRoot" Background="{StaticResource BgBrush}">
                 <Grid.RowDefinitions>
                     <RowDefinition Height="Auto"/>
                     <RowDefinition Height="Auto"/>
                     <RowDefinition Height="*"/>
                 </Grid.RowDefinitions>
+
+                <!-- Ambient wall wash, matching #tint on the web: recolored
+                     by whatever card is hovered (see AttachHoverTint in
+                     MainWindow.xaml.cs), settling back to the hero's own
+                     sampled colour on mouseleave. The gradient's SHAPE is a
+                     pre-dithered image (see tint-wall-mask.png's comment in
+                     the .csproj) used as an OpacityMask over a plain
+                     solid-colour brush, instead of a live WPF gradient
+                     brush, which bands visibly on a wide, low-contrast
+                     fade over a near-black background, exactly this shape. -->
+                <Border Grid.RowSpan="3" IsHitTestVisible="False">
+                    <Border.Background>
+                        <SolidColorBrush x:Name="WallTintBrush" Color="#9A7D4A"/>
+                    </Border.Background>
+                    <Border.OpacityMask>
+                        <ImageBrush ImageSource="Assets/tint-wall-mask.png" Stretch="Fill"
+                                    RenderOptions.BitmapScalingMode="HighQuality"/>
+                    </Border.OpacityMask>
+                </Border>
 
                 <DockPanel Grid.Row="0" Margin="28,18,28,10" LastChildFill="False">
                     <!-- Wordmark: matches the site's own .wordmark exactly,
@@ -128,7 +137,18 @@
 
                 <ScrollViewer x:Name="MainScroll" Grid.Row="2" VerticalScrollBarVisibility="Auto"
                               ScrollChanged="MainScroll_ScrollChanged">
-                    <StackPanel x:Name="SectionsPanel" Margin="20,4,20,20"/>
+                    <!-- The site's own #file-grid/etc also cap at a 980px
+                         shell, but that number was sized for a shared
+                         browser viewport: centering the wall inside it in
+                         this app's own dedicated (and wider by default)
+                         window left large empty margins on both sides that
+                         just read as too much padding, not fidelity to the
+                         site. Kept only the side gutter (2rem, matching the
+                         site's own gutter variable), letting the wall use
+                         the window's actual width instead. -->
+                    <Border Padding="32,4,32,32">
+                        <StackPanel x:Name="SectionsPanel"/>
+                    </Border>
                 </ScrollViewer>
             </Grid>
 
@@ -184,8 +204,31 @@
                  not covered edge-to-edge) with an inset panel holding the
                  actual player, closer to the web's modal than a full
                  takeover. -->
-            <Grid x:Name="PlayerOverlay" Background="#D2000000" Visibility="Collapsed">
-                <Border Margin="56" Background="Black" CornerRadius="8" ClipToBounds="True">
+            <Grid x:Name="PlayerOverlay" Background="#D2000000" Visibility="Collapsed"
+                  MouseMove="PlayerOverlay_MouseMove"
+                  MouseLeftButtonUp="PlayerOverlay_MouseLeftButtonUp">
+                <!-- Now-playing wash, matching #modal's own continuous
+                     animated radial gradient in main.go's CSS: tinted with
+                     the current track's own sampled colour (see PlayAsync),
+                     slowly breathing in intensity and drifting position so
+                     any residual dithering pattern reads as motion rather
+                     than a static artifact: the same anti-banding
+                     rationale as the wall's tint, just always-on instead of
+                     hover-gated. -->
+                <Border x:Name="PlayerTint" IsHitTestVisible="False" Opacity="0.4">
+                    <Border.RenderTransform>
+                        <TranslateTransform x:Name="PlayerTintDrift"/>
+                    </Border.RenderTransform>
+                    <Border.Background>
+                        <SolidColorBrush x:Name="PlayerTintBrush" Color="#9A7D4A"/>
+                    </Border.Background>
+                    <Border.OpacityMask>
+                        <ImageBrush ImageSource="Assets/tint-player-mask.png" Stretch="Fill"
+                                    RenderOptions.BitmapScalingMode="HighQuality"/>
+                    </Border.OpacityMask>
+                </Border>
+
+                <Border x:Name="PlayerFrame" Margin="56" Background="Black" CornerRadius="8" ClipToBounds="True">
                     <Grid>
                         <Grid.RowDefinitions>
                             <RowDefinition Height="Auto"/>
@@ -200,7 +243,7 @@
                              never gets a click or even renders visibly. Also
                              deliberately not next to the play/pause button below,
                              so it isn't mistaken for a "previous" control. -->
-                        <Border Grid.Row="0" Background="Black" Padding="6">
+                        <Border x:Name="BackButtonBar" Grid.Row="0" Background="Black" Padding="6">
                             <Button HorizontalAlignment="Left" Style="{StaticResource IconButton}"
                                     Click="ClosePlayer_Click" ToolTip="Back to library">
                                 <Path Data="{StaticResource IconBack}" Fill="{StaticResource TextBrush}"
@@ -210,7 +253,7 @@
 
                         <vlc:VideoView x:Name="Player" Grid.Row="1" Background="Black"/>
 
-                        <Grid Grid.Row="2" Background="{StaticResource Bg2Brush}">
+                        <Grid x:Name="ControlsBar" Grid.Row="2" Background="{StaticResource Bg2Brush}">
                             <StackPanel Margin="16,10">
                                 <TextBlock x:Name="NowPlayingText" Foreground="{StaticResource TextBrush}"
                                            FontFamily="{StaticResource SansFont}" FontSize="13" Margin="0,0,0,6"/>
@@ -240,6 +283,16 @@
                                     <Button x:Name="SettingsButton" DockPanel.Dock="Right" Style="{StaticResource IconButton}"
                                             Click="ToggleSettingsPanel_Click" Margin="0,0,4,0" ToolTip="Audio, subtitles, speed, aspect">
                                         <TextBlock Text="⚙" FontSize="16" Foreground="{StaticResource TextBrush}"/>
+                                    </Button>
+
+                                    <!-- Matches minimizePlayer in main.go's frontend JS:
+                                         a small corner box that keeps playing while the
+                                         wall underneath becomes reachable again, rather
+                                         than real (separate-window) Picture-in-Picture. -->
+                                    <Button x:Name="MinimizeButton" DockPanel.Dock="Right" Style="{StaticResource IconButton}"
+                                            Click="MinimizePlayer_Click" Margin="0,0,4,0" ToolTip="Minimize"
+                                            FontFamily="Segoe MDL2 Assets">
+                                        <TextBlock Text="&#xE921;" FontSize="11" Foreground="{StaticResource TextBrush}"/>
                                     </Button>
                                 </DockPanel>
                             </StackPanel>
