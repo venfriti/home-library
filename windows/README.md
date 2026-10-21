@@ -10,8 +10,6 @@ AC3/EAC3/DTS/TrueHD/FLAC tracks that fall outside it. libVLC bundles real
 libav decoders, so those codecs just decode, no server-side remuxing
 gymnastics required.
 
-![Windows player home screen](../docs/screenshots/windows-home.jpg)
-
 It is a **client only**. All library scanning, TMDB enrichment, and the
 transcode pipeline stay on the Go server (`main.go`) exactly as they are
 today; this app just talks to the same HTTP API the web frontend already

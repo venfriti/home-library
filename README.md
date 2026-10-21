@@ -6,30 +6,7 @@ and a cloud library (Cloudflare R2, HLS-transcoded via ffmpeg) behind a
 single-user login. Everything — server, HTML/CSS/JS, templates — lives in
 [main.go](main.go).
 
-## Screenshots
-
-The web UI. The home page opens on a full-width hero with the header floating
-over it; the header turns solid once you scroll into the rows.
-
-![Home page hero](docs/screenshots/web-home.jpg)
-
-![Continue watching and Films rows](docs/screenshots/web-rows.jpg)
-
-Movie and show detail pages: full-bleed backdrop, resume with progress,
-start over, and for shows the season's episode list underneath.
-
-![Movie detail page](docs/screenshots/web-movie.jpg)
-
-![Show detail page](docs/screenshots/web-show.jpg)
-
-The detail-page design these are built from, including the minimized
-corner player:
-
-![Movie detail page design](docs/screenshots/detail-preview.jpg)
-
-On a phone the search pill collapses to an icon and the hero stacks.
-
-<img src="docs/screenshots/web-phone.jpg" alt="Home page at phone width" width="300">
+![Movie detail page](docs/screenshots/detail-preview.jpg)
 
 There is also a native Windows client — see [windows/README.md](windows/README.md).
 
