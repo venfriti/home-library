@@ -1,0 +1,8 @@
+<resources>
+    <!-- Compose owns all real UI; this just sets the window background so
+         the brief moment before Compose takes over isn't a flash of white. -->
+    <style name="Theme.Stream" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/background</item>
+        <item name="android:statusBarColor">@color/background</item>
+    </style>
+</resources>

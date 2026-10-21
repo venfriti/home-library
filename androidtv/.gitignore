@@ -1,0 +1,23 @@
+*.iml
+.gradle/
+/local.properties
+.idea/
+.DS_Store
+/build
+/app/build*/
+/captures
+.externalNativeBuild
+.cxx
+*.apk
+*.aab
+
+# Release signing -- generated locally, never committed. Losing this key
+# means every future "update" build gets rejected by Android as a signature
+# mismatch, forcing a fresh install (and losing saved login/session data on
+# every device it's pushed to) -- back both of these up somewhere safe
+# outside the repo.
+/keystore/
+/keystore.properties
+
+# Packaged source snapshots
+*.zip

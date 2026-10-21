@@ -1,0 +1,52 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <!-- Self-update: REQUEST_INSTALL_PACKAGES lets this app open a
+         PackageInstaller session at all; UPDATE_PACKAGES_WITHOUT_USER_ACTION
+         is what lets that session skip the install confirmation prompt on
+         Android 12+ when the app is updating itself. Both are normal,
+         freely-declarable permissions, not gated behind system/signature
+         privilege. -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <uses-permission android:name="android.permission.UPDATE_PACKAGES_WITHOUT_USER_ACTION" />
+
+    <!-- TV has no touchscreen and isn't guaranteed to have a d-pad-shaped
+         input device registered the same way a phone reports a touchscreen:
+         both declared not-required so this doesn't get filtered out on
+         device compatibility, matching how sideloaded TV apps are usually
+         packaged. -->
+    <uses-feature
+        android:name="android.software.leanback"
+        android:required="false" />
+    <uses-feature
+        android:name="android.hardware.touchscreen"
+        android:required="false" />
+
+    <application
+        android:allowBackup="true"
+        android:banner="@drawable/tv_banner"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:label="@string/app_name"
+        android:theme="@style/Theme.Stream"
+        android:usesCleartextTraffic="true">
+        <!-- usesCleartextTraffic: the server is commonly reached over plain
+             http on the local network (see the Windows client's own README,
+             e.g. http://<lan-ip>:5746), not always behind a tunnel/https. -->
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:screenOrientation="landscape"
+            android:theme="@style/Theme.Stream">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+                <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+
+</manifest>

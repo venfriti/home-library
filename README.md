@@ -6,6 +6,33 @@ and a cloud library (Cloudflare R2, HLS-transcoded via ffmpeg) behind a
 single-user login. Everything — server, HTML/CSS/JS, templates — lives in
 [main.go](main.go).
 
+## Screenshots
+
+The web UI. The home page opens on a full-width hero with the header floating
+over it; the header turns solid once you scroll into the rows.
+
+![Home page hero](docs/screenshots/web-home.jpg)
+
+![Continue watching and Films rows](docs/screenshots/web-rows.jpg)
+
+Movie and show detail pages: full-bleed backdrop, resume with progress,
+start over, and for shows the season's episode list underneath.
+
+![Movie detail page](docs/screenshots/web-movie.jpg)
+
+![Show detail page](docs/screenshots/web-show.jpg)
+
+The detail-page design these are built from, including the minimized
+corner player:
+
+![Movie detail page design](docs/screenshots/detail-preview.jpg)
+
+On a phone the search pill collapses to an icon and the hero stacks.
+
+<img src="docs/screenshots/web-phone.jpg" alt="Home page at phone width" width="300">
+
+There is also a native Windows client — see [windows/README.md](windows/README.md).
+
 ## Running it
 
 ```
@@ -79,25 +106,11 @@ go build -o stream.new.exe .
 - **FileDrop** — shares a session cookie with a configured external
   FileDrop instance so both apps see the same logged-in session.
 
-## Windows app
-
-`windows/` is a native Windows client (WPF + libVLC) that mirrors the web
-UI's own local site pixel-for-pixel while adding native-only extras (a
-local/online library toggle, full VLC-backed audio/subtitle/speed/aspect
-controls). It talks to the same HTTP API as the web frontend — no server
-changes needed beyond the LAN-only `/local/...` routes it also uses. See
-[windows/README.md](windows/README.md).
-
 ## Data files
 
-All persistent server state lives under `data/` (see `dataDir()` in
-`main.go`). `data/local_meta.json` is tracked in git — it's the enrichment
-cache, and some of its entries carry hand-corrected fields (title, tmdb id,
-season/episode, is_extra/main_key) that a bulk enrichment pass must never
-overwrite; any schema-changing or bulk-touching change to it should be
-backed up first (see `data/metadata-backups/`, itself gitignored).
-`data/windows_app_version.json` is also tracked — it's the release pointer
-the Windows app's update check reads, hand-edited when cutting a release.
-`data/playlists.json`, `data/watch_history.json` and
-`data/playback_progress.json` are local runtime state and are not
-committed.
+`local_meta.json` is tracked in git — it's the enrichment cache, and some of
+its entries carry hand-corrected fields (title, tmdb id, season/episode,
+is_extra/main_key) that a bulk enrichment pass must never overwrite; any
+schema-changing or bulk-touching change to it should be backed up first (see
+`metadata-backups/`, itself gitignored). `playlists.json`, `watch_history.json`
+and `playback_progress.json` are local runtime state and are not committed.

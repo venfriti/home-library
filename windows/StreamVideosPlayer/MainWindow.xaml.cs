@@ -312,6 +312,13 @@ public partial class MainWindow : Window
         _heroElement = AddHeroBanner(PickHero());
         if (_heroElement is not null) SectionsPanel.Children.Add(_heroElement);
         ScheduleHeroRoll();
+        // .rail-head:first-child's tight 3px top margin only reads right
+        // sitting right under the hero's own ~340px of visual bulk -- with
+        // no hero at all (PickHero found nothing anywhere), that same 3px
+        // put the first rail-head's text almost flush against the section
+        // tags bar above it. Falling back to the normal 30px spacing here
+        // instead keeps that from happening.
+        _firstRailHead = _heroElement is not null;
         AddFileSection("rail-continue-watching", "Continue watching", continueWatching, "ContinueWatchingCardListBox");
         AddFileSection("rail-films", "Films", Filter(_allFiles.Where(f => f.Section == ContentSection.Film)), "CardListBox");
         AddSeriesSection(Filter(_allFiles.Where(f => f.Section == ContentSection.Series)));
@@ -373,10 +380,16 @@ public partial class MainWindow : Window
         }
 
         // pickHeroFilm's own "standalone" pool: not a tv item grouped into a
-        // show (see groupBySeries -- tv with a real tmdb_id).
+        // show (see groupBySeries -- tv with a real tmdb_id). Relaxed to
+        // accept poster/thumbnail art too, not just backdrop/episode_still
+        // like the primary tier above and the web's own heroCandidates --
+        // this local library's TMDB backdrop enrichment is spotty enough
+        // that a strict match here left the hero (and the vertical space
+        // it normally buys the first rail-head, see BuildRailHead) missing
+        // far more often than the site ever shows an empty banner.
         var standalone = _allFiles.Where(f => !(f.MediaType == "tv" && f.TmdbId > 0)).ToList();
-        var pool = standalone.Where(f => f.MediaType == "movie" && !string.IsNullOrEmpty(f.HeroArt)).ToList();
-        if (pool.Count == 0) pool = standalone.Where(f => !string.IsNullOrEmpty(f.HeroArt)).ToList();
+        var pool = standalone.Where(f => f.MediaType == "movie" && !string.IsNullOrEmpty(f.HeroArt ?? f.CardImageUrl)).ToList();
+        if (pool.Count == 0) pool = standalone.Where(f => !string.IsNullOrEmpty(f.HeroArt ?? f.CardImageUrl)).ToList();
         return pool.Count > 0 ? pool[_heroRandom.Next(pool.Count)] : null;
     }
 
@@ -434,7 +447,10 @@ public partial class MainWindow : Window
     private Border? AddHeroBanner(FileEntry? hero)
     {
         if (hero is null) return null;
-        var imageUrl = hero.HeroArt;
+        // Backdrop/episode still first, same as the site; falls back to
+        // whatever card art exists (see PickHero's own relaxed fallback
+        // tier) rather than giving up and leaving the banner empty.
+        var imageUrl = hero.HeroArt ?? hero.CardImageUrl;
         if (string.IsNullOrEmpty(imageUrl)) return null;
 
         // tintDefault in main.go's own updateHero: the wall tint settles
@@ -1049,6 +1065,9 @@ public partial class MainWindow : Window
 
         _current = entry;
         NowPlayingText.Text = entry.DisplayTitle;
+        NowPlayingThumb.Source = string.IsNullOrEmpty(entry.ThumbnailImageUrl)
+            ? null
+            : new System.Windows.Media.Imaging.BitmapImage(new Uri(entry.ThumbnailImageUrl));
         PlayerOverlay.Visibility = Visibility.Visible;
         SetPlayerControlsVisible(true);
         _controlsIdleTimer.Stop();

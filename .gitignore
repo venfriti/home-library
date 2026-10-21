@@ -14,3 +14,11 @@ start-result.txt
 stop-result.txt
 playlist_covers/
 _pruned-*/
+
+# Local exports, caches and design mockups -- not part of the app
+library-export.zip
+library-export/
+data/trickplay_cache/
+index (2).html
+stream-home-preview.html
+stream-detail-preview.html

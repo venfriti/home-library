@@ -1212,9 +1212,26 @@ func localThumbnailPath(absVideoPath string) string {
 }
 
 func extractThumbnail(inPath, outPath string, durationSec int) error {
+	// A fixed 5s was fine for the short music videos this was built for, but
+	// a full-length movie or TV episode is still inside its studio/network
+	// logo intro at 5s -- this now scales with runtime instead (5% in,
+	// clamped to 30s-180s) so the grabbed frame is past that.
 	seek := "00:00:05"
-	if durationSec > 0 && durationSec < 10 {
+	switch {
+	case durationSec > 0 && durationSec < 10:
 		seek = "00:00:00"
+	case durationSec >= 10:
+		t := durationSec / 20
+		if t < 30 {
+			t = 30
+		}
+		if t > 180 {
+			t = 180
+		}
+		if t >= durationSec {
+			t = durationSec / 2
+		}
+		seek = fmt.Sprintf("%02d:%02d:%02d", t/3600, (t%3600)/60, t%60)
 	}
 	return exec.Command(ffmpegBin(),
 		"-y",
@@ -1277,15 +1294,16 @@ func localThumbnailPathAlt(absVideoPath string) string {
 }
 
 // extractThumbnailAlt grabs a visibly different point in the video than
-// extractThumbnail's fixed 5s (or shorter clips scale down proportionally
-// instead of colliding with it at 0s too).
+// extractThumbnail (which lands at least 30s in, or halfway through clips
+// shorter than that) -- a quarter of the way in for short clips, 20s
+// otherwise.
 func extractThumbnailAlt(inPath, outPath string, durationSec int) error {
 	seek := "00:00:20"
 	switch {
 	case durationSec > 0 && durationSec < 10:
 		seek = "00:00:00"
 	case durationSec > 0 && durationSec < 40:
-		seek = fmt.Sprintf("00:00:%02d", durationSec/2)
+		seek = fmt.Sprintf("00:00:%02d", durationSec/4)
 	}
 	return exec.Command(ffmpegBin(),
 		"-y",
@@ -1296,6 +1314,180 @@ func extractThumbnailAlt(inPath, outPath string, durationSec int) error {
 		"-vf", "scale=640:-1",
 		outPath,
 	).Run()
+}
+
+// ─── Trickplay: scrub-preview sprite sheets ─────────────────────────────────
+//
+// One frame every trickInterval seconds, tiled trickCols x trickRows per JPEG
+// sheet (sheet_001.jpg, sheet_002.jpg, ...). Sheets are capped at 8x8 of
+// 320x180 so each one decodes to a few MB on a TV rather than one giant image
+// per film. Built the first time a client asks for a video's info, in the
+// background, one video at a time; -skip_frame nokey decodes only keyframes
+// so a 2h 4K HEVC file costs seconds-to-minutes rather than a full decode.
+const (
+	trickInterval = 10
+	trickTileW    = 320
+	trickTileH    = 180
+	trickCols     = 8
+	trickRows     = 8
+)
+
+type trickplayInfo struct {
+	Ready    bool `json:"ready"`
+	Interval int  `json:"interval"`
+	TileW    int  `json:"tile_w"`
+	TileH    int  `json:"tile_h"`
+	Cols     int  `json:"cols"`
+	Rows     int  `json:"rows"`
+	Count    int  `json:"count"`
+	Sheets   int  `json:"sheets"`
+}
+
+var (
+	trickplayMu      sync.Mutex
+	trickplayRunning = map[string]bool{}
+	// Failures are remembered for the process lifetime so a file ffmpeg can't
+	// read isn't re-attempted on every player open.
+	trickplayFailed = map[string]bool{}
+	trickplaySem    = make(chan struct{}, 1)
+)
+
+func trickplayDir(absVideoPath string) string {
+	return filepath.Join(dataDir(), "trickplay_cache", hex.EncodeToString(sha256Sum(absVideoPath)))
+}
+
+func readTrickplayInfo(dir string) (trickplayInfo, bool) {
+	b, err := os.ReadFile(filepath.Join(dir, "info.json"))
+	if err != nil {
+		return trickplayInfo{}, false
+	}
+	var info trickplayInfo
+	if json.Unmarshal(b, &info) != nil {
+		return trickplayInfo{}, false
+	}
+	return info, true
+}
+
+// ensureTrickplay returns the finished info if it exists; otherwise it kicks
+// off generation (once) and reports not-ready so the client can ask again.
+func ensureTrickplay(absVideoPath string) trickplayInfo {
+	if info, ok := readTrickplayInfo(trickplayDir(absVideoPath)); ok {
+		return info
+	}
+	trickplayMu.Lock()
+	defer trickplayMu.Unlock()
+	if !trickplayRunning[absVideoPath] && !trickplayFailed[absVideoPath] {
+		trickplayRunning[absVideoPath] = true
+		go generateTrickplay(absVideoPath)
+	}
+	return trickplayInfo{Ready: false}
+}
+
+func generateTrickplay(absVideoPath string) {
+	ok := false
+	defer func() {
+		trickplayMu.Lock()
+		delete(trickplayRunning, absVideoPath)
+		if !ok {
+			trickplayFailed[absVideoPath] = true
+		}
+		trickplayMu.Unlock()
+	}()
+	trickplaySem <- struct{}{}
+	defer func() { <-trickplaySem }()
+
+	dir := trickplayDir(absVideoPath)
+	tmp := dir + ".tmp"
+	os.RemoveAll(tmp)
+	if err := os.MkdirAll(tmp, 0755); err != nil {
+		return
+	}
+	defer os.RemoveAll(tmp)
+
+	meta, isVideo, _ := probeVideo(absVideoPath)
+	if !isVideo || meta.Duration <= 0 {
+		return
+	}
+
+	vf := fmt.Sprintf(
+		"fps=1/%d,scale=%d:%d:force_original_aspect_ratio=decrease,pad=%d:%d:(ow-iw)/2:(oh-ih)/2,tile=%dx%d",
+		trickInterval, trickTileW, trickTileH, trickTileW, trickTileH, trickCols, trickRows,
+	)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	defer cancel()
+	err := exec.CommandContext(ctx, ffmpegBin(),
+		"-hide_banner", "-loglevel", "error",
+		"-skip_frame", "nokey",
+		"-i", absVideoPath,
+		"-an", "-sn",
+		"-vf", vf,
+		"-q:v", "5",
+		filepath.Join(tmp, "sheet_%03d.jpg"),
+	).Run()
+	if err != nil {
+		log.Printf("trickplay: %s: %v", absVideoPath, err)
+		return
+	}
+
+	sheets, _ := filepath.Glob(filepath.Join(tmp, "sheet_*.jpg"))
+	if len(sheets) == 0 {
+		return
+	}
+	perSheet := trickCols * trickRows
+	count := (meta.Duration + trickInterval - 1) / trickInterval
+	if limit := len(sheets) * perSheet; count > limit {
+		count = limit
+	}
+	info := trickplayInfo{
+		Ready: true, Interval: trickInterval,
+		TileW: trickTileW, TileH: trickTileH,
+		Cols: trickCols, Rows: trickRows,
+		Count: count, Sheets: len(sheets),
+	}
+	b, _ := json.Marshal(info)
+	if os.WriteFile(filepath.Join(tmp, "info.json"), b, 0644) != nil {
+		return
+	}
+	os.RemoveAll(dir)
+	if os.Rename(tmp, dir) != nil {
+		return
+	}
+	ok = true
+}
+
+// GET /local/trickplay?path=<rel>          -> trickplayInfo JSON
+// GET /local/trickplay?path=<rel>&sheet=N  -> sheet_N JPEG (1-based)
+func (c *serverCtx) handleLocalTrickplay(w http.ResponseWriter, r *http.Request) {
+	path := r.URL.Query().Get("path")
+	if !c.isAuthed(r) && !c.validFileToken(path, r.URL.Query().Get("tok")) {
+		http.Error(w, "unauthorized", 401)
+		return
+	}
+	full, ok := c.resolveLocalPath(path)
+	if !ok {
+		http.Error(w, "not found", 404)
+		return
+	}
+	sheet := r.URL.Query().Get("sheet")
+	if sheet == "" {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-store")
+		json.NewEncoder(w).Encode(ensureTrickplay(full))
+		return
+	}
+	n, err := strconv.Atoi(sheet)
+	if err != nil || n < 1 {
+		http.Error(w, "bad sheet", 400)
+		return
+	}
+	p := filepath.Join(trickplayDir(full), fmt.Sprintf("sheet_%03d.jpg", n))
+	if !fileExists(p) {
+		http.Error(w, "not found", 404)
+		return
+	}
+	w.Header().Set("Content-Type", "image/jpeg")
+	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+	http.ServeFile(w, r, p)
 }
 
 // ─── LLM + TMDB enrichment ───────────────────────────────────────────────────
@@ -1349,7 +1541,10 @@ func (c *serverCtx) llmChat(prompt string) (string, error) {
 	if c.llmAPIKey != "" {
 		req.Header.Set("Authorization", "Bearer "+c.llmAPIKey)
 	}
-	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
+	// 90s, not 30: ollama unloads the model after a few idle minutes, and
+	// loading llama3.2:3b back from disk alone takes ~30s, so the first file
+	// after a quiet spell timed out every time.
+	resp, err := (&http.Client{Timeout: 90 * time.Second}).Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -2686,6 +2881,230 @@ func (c *serverCtx) fetchMusicVideo(url, title string) {
 	c.kickEnrichment()
 }
 
+// ─── SoundCloud search / fetch (yt-dlp) ───────────────────────────────────────
+//
+// Same tool as the YouTube search, via its scsearch: prefix. SoundCloud is
+// audio only while the library (and both players) are video only, so a
+// fetched track is written as an MP4 of its cover art over the audio and
+// lands in the music-video folder like anything else.
+
+func (c *serverCtx) searchSoundCloud(query string) ([]musicHit, error) {
+	if strings.TrimSpace(query) == "" {
+		return nil, fmt.Errorf("empty query")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, c.ytdlpBin(),
+		"scsearch12:"+query,
+		"--dump-json", "--flat-playlist", "--no-warnings", "--ignore-errors",
+	).Output()
+	if err != nil && len(out) == 0 {
+		return nil, fmt.Errorf("yt-dlp search: %v", err)
+	}
+
+	artist := leadArtist(query)
+	var hits []musicHit
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || !strings.HasPrefix(line, "{") {
+			continue
+		}
+		var d struct {
+			ID         string  `json:"id"`
+			Title      string  `json:"title"`
+			Uploader   string  `json:"uploader"`
+			Duration   float64 `json:"duration"`
+			ViewCount  int64   `json:"view_count"`
+			WebpageURL string  `json:"webpage_url"`
+			Thumbnails []struct {
+				ID  string `json:"id"`
+				URL string `json:"url"`
+			} `json:"thumbnails"`
+		}
+		if json.Unmarshal([]byte(line), &d) != nil || d.WebpageURL == "" {
+			continue
+		}
+		// 500x500 artwork when offered: sharp enough for the list and for the
+		// still frame a fetch is built from, without the multi-MB original.
+		thumb := ""
+		for _, t := range d.Thumbnails {
+			if t.ID == "t500x500" {
+				thumb = t.URL
+			}
+		}
+		if thumb == "" && len(d.Thumbnails) > 0 {
+			thumb = d.Thumbnails[len(d.Thumbnails)-1].URL
+		}
+		up := normalizeTitle(d.Uploader)
+		official := artist != "" && up != "" && (strings.Contains(up, artist) || strings.Contains(artist, up))
+		hits = append(hits, musicHit{
+			ID: d.ID, Title: d.Title, Channel: d.Uploader, Duration: d.Duration,
+			Views: d.ViewCount, Thumbnail: thumb, URL: d.WebpageURL, Official: official,
+		})
+	}
+	sort.SliceStable(hits, func(i, j int) bool { return hits[i].Official && !hits[j].Official })
+	return hits, nil
+}
+
+func (c *serverCtx) handleSearchSoundCloud(w http.ResponseWriter, r *http.Request) {
+	if !c.isAuthed(r) {
+		http.Error(w, "unauthorized", 401)
+		return
+	}
+	hits, err := c.searchSoundCloud(r.URL.Query().Get("q"))
+	if err != nil {
+		http.Error(w, err.Error(), 502)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(hits)
+}
+
+// fetchSoundCloudTrack downloads a track's audio and cover, then builds an MP4
+// from them (the art as a still frame, 2fps, so the file stays about the size
+// of the audio). Progress goes through the same procMap key scheme as the
+// YouTube fetch ("yt:"+url), which the page already polls.
+func (c *serverCtx) fetchSoundCloudTrack(url, title, artist string) {
+	dest := c.musicLibraryRoot()
+	if dest == "" {
+		logger.Printf("soundcloud fetch: no music_video folder configured")
+		return
+	}
+	key := "yt:" + url
+	fail := func(msg string) {
+		logger.Printf("soundcloud fetch failed %s: %s", title, msg)
+		c.setProcState(key, procState{Status: "error", Err: msg, Title: title})
+	}
+	c.setProcState(key, procState{Status: "processing", Title: title})
+
+	tmp, err := os.MkdirTemp("", "soundcloud-*")
+	if err != nil {
+		fail(err.Error())
+		return
+	}
+	defer os.RemoveAll(tmp)
+
+	args := []string{
+		"-f", "bestaudio/best",
+		"-o", filepath.Join(tmp, "audio.%(ext)s"),
+		"-o", "thumbnail:" + filepath.Join(tmp, "cover.%(ext)s"),
+		"--write-thumbnail", "--convert-thumbnails", "jpg",
+		"--no-playlist", "--newline", "--no-warnings", "-R", "5",
+	}
+	if cfg.FFmpegPath != "" {
+		args = append(args, "--ffmpeg-location", filepath.Dir(cfg.FFmpegPath))
+	}
+	args = append(args, url)
+	cmd := exec.Command(c.ytdlpBin(), args...)
+	stdout, pipeErr := cmd.StdoutPipe()
+	if pipeErr != nil {
+		fail(pipeErr.Error())
+		return
+	}
+	cmd.Stderr = cmd.Stdout
+	if startErr := cmd.Start(); startErr != nil {
+		fail(startErr.Error())
+		return
+	}
+	var tail []string
+	sc := bufio.NewScanner(stdout)
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" {
+			continue
+		}
+		tail = append(tail, line)
+		if len(tail) > 12 {
+			tail = tail[1:]
+		}
+		if m := ytProgressRe.FindStringSubmatch(line); m != nil {
+			if pct, perr := strconv.ParseFloat(m[1], 64); perr == nil {
+				// Leave headroom: building the video is the last step.
+				c.setProcState(key, procState{Status: "processing", Percent: pct * 0.9, Stage: "downloading", Title: title})
+			}
+		}
+	}
+	if err := cmd.Wait(); err != nil {
+		msg := "yt-dlp: " + err.Error()
+		if len(tail) > 0 {
+			msg = tail[len(tail)-1]
+		}
+		fail(msg)
+		return
+	}
+
+	var audio string
+	if matches, _ := filepath.Glob(filepath.Join(tmp, "audio.*")); len(matches) > 0 {
+		audio = matches[0]
+	}
+	if audio == "" {
+		fail("no audio was downloaded")
+		return
+	}
+	cover := filepath.Join(tmp, "cover.jpg")
+
+	// Named "Artist - Title" (unless the title already carries a dash), which
+	// is what the music-video filename parsing reads the artist from.
+	name := title
+	if !strings.Contains(title, " - ") && strings.TrimSpace(artist) != "" {
+		name = artist + " - " + title
+	}
+	name = safeSegment(name)
+	if name == "" {
+		name = "SoundCloud track"
+	}
+	final := filepath.Join(dest, name+".mp4")
+	if fileExists(final) {
+		fail("already in the library")
+		return
+	}
+
+	c.setProcState(key, procState{Status: "processing", Percent: 95, Stage: "merging", Title: title})
+	built := filepath.Join(tmp, "out.mp4")
+	ff := []string{"-y"}
+	vf := "format=yuv420p"
+	if fileExists(cover) {
+		ff = append(ff, "-loop", "1", "-framerate", "2", "-i", cover)
+		// Square art centred on a 1280x720 black frame.
+		vf = "scale=720:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:color=black,format=yuv420p"
+	} else {
+		ff = append(ff, "-f", "lavfi", "-i", "color=c=black:s=1280x720:r=2")
+	}
+	ff = append(ff, "-i", audio)
+	// -shortest overshoots by several seconds against a looped still (the
+	// video encoder has frames buffered past the audio's end), so trim to the
+	// audio's own length when it can be read.
+	if out, err := exec.Command(ffprobeBin(), "-v", "error", "-show_entries", "format=duration",
+		"-of", "csv=p=0", audio).Output(); err == nil {
+		if secs, perr := strconv.ParseFloat(strings.TrimSpace(string(out)), 64); perr == nil && secs > 0 {
+			ff = append(ff, "-t", strconv.FormatFloat(secs, 'f', 3, 64))
+		}
+	}
+	ff = append(ff,
+		"-vf", vf,
+		"-c:v", "libx264", "-tune", "stillimage", "-preset", "veryfast", "-r", "2", "-g", "4",
+		"-c:a", "aac", "-b:a", "192k",
+		"-shortest", "-movflags", "+faststart",
+		built,
+	)
+	if out, err := exec.Command(ffmpegBin(), ff...).CombinedOutput(); err != nil {
+		lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+		fail("ffmpeg: " + lines[len(lines)-1])
+		return
+	}
+	if err := os.Rename(built, final); err != nil {
+		// A rename across volumes fails on Windows, so fall back to a copy.
+		if cpErr := copyFile(built, final); cpErr != nil {
+			fail(cpErr.Error())
+			return
+		}
+	}
+	logger.Printf("soundcloud fetch complete: %s -> %s", title, final)
+	c.clearProcState(key)
+	c.kickEnrichment()
+}
+
 func (c *serverCtx) handleDownloadMusic(w http.ResponseWriter, r *http.Request) {
 	if !c.isAuthed(r) {
 		http.Error(w, "unauthorized", 401)
@@ -2696,11 +3115,18 @@ func (c *serverCtx) handleDownloadMusic(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	var body struct {
-		URL   string `json:"url"`
-		Title string `json:"title"`
+		URL    string `json:"url"`
+		Title  string `json:"title"`
+		Artist string `json:"artist"`
 	}
 	if json.NewDecoder(r.Body).Decode(&body) != nil || body.URL == "" {
 		http.Error(w, "bad request", 400)
+		return
+	}
+	if strings.HasPrefix(body.URL, "https://soundcloud.com/") || strings.HasPrefix(body.URL, "https://m.soundcloud.com/") {
+		go c.fetchSoundCloudTrack(body.URL, body.Title, body.Artist)
+		w.WriteHeader(202)
+		fmt.Fprint(w, "started")
 		return
 	}
 	if !strings.HasPrefix(body.URL, "https://www.youtube.com/") &&
@@ -3067,6 +3493,23 @@ func (c *serverCtx) handleWindowsAppVersion(w http.ResponseWriter, r *http.Reque
 	}
 	w.Header().Set("Content-Type", "application/json")
 	data, err := os.ReadFile(filepath.Join(dataDir(), "windows_app_version.json"))
+	if err != nil {
+		fmt.Fprint(w, "{}")
+		return
+	}
+	w.Write(data)
+}
+
+// handleAndroidTVAppVersion mirrors handleWindowsAppVersion exactly for the
+// Android TV client (see androidtv/) -- same hand-edited-JSON source of
+// truth, same "no file yet means no release published" fallback.
+func (c *serverCtx) handleAndroidTVAppVersion(w http.ResponseWriter, r *http.Request) {
+	if !c.isAuthed(r) {
+		http.Error(w, "unauthorized", 401)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	data, err := os.ReadFile(filepath.Join(dataDir(), "androidtv_app_version.json"))
 	if err != nil {
 		fmt.Fprint(w, "{}")
 		return
@@ -4782,7 +5225,10 @@ func firstVideoStreamIndex(path string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	return strconv.Atoi(strings.TrimSpace(string(out)))
+	// Dolby Vision streams carry side data that ffprobe prints as an extra
+	// (empty) CSV column -- "0," -- so take only the first field.
+	first, _, _ := strings.Cut(strings.TrimSpace(string(out)), ",")
+	return strconv.Atoi(strings.TrimSpace(first))
 }
 
 // remuxWithDefaults fixes which audio and subtitle track a file will
@@ -5970,7 +6416,6 @@ var loginTmpl = template.Must(template.New("login").Parse(`<!DOCTYPE html>
 body{background:#0d0d0d;color:#e0e0e0;font-family:'SF Mono',Consolas,monospace;display:flex;align-items:center;justify-content:center;min-height:100vh}
 .box{width:100%;max-width:340px;padding:2rem}
 h1{font-family:'Libre Baskerville',Georgia,serif;font-size:1.5rem;font-weight:700;letter-spacing:.03em;color:#e0e0e0;margin-bottom:2rem}
-h1 span{color:#9A7D4A;font-weight:400;font-style:italic}
 input{width:100%;background:#1a1a1a;border:1px solid #333;color:#e0e0e0;padding:.75rem 1rem;font-family:inherit;font-size:.9rem;border-radius:4px;outline:none;margin-bottom:1rem}
 input:focus{border-color:#9A7D4A}
 button{width:100%;background:#9A7D4A;border:none;color:#0d0d0d;padding:.75rem;font-family:inherit;font-size:.9rem;font-weight:600;border-radius:4px;cursor:pointer}
@@ -5979,7 +6424,7 @@ button{width:100%;background:#9A7D4A;border:none;color:#0d0d0d;padding:.75rem;fo
 </head>
 <body>
 <div class="box">
-  <h1>Stream<span>Videos</span></h1>
+  <h1>Stream</h1>
   {{if .Error}}<div class="err">{{.Error}}</div>{{end}}
   <form method="POST">
     <input type="password" name="password" placeholder="password" autofocus autocomplete="current-password">
@@ -6004,7 +6449,7 @@ var mainTmpl = template.Must(template.New("main").Parse(`<!DOCTYPE html>
 body{background:var(--bg);color:var(--text);font-family:var(--font-mono);font-weight:300;font-size:.875rem;min-height:100vh;overflow-x:hidden}
 a{color:inherit;text-decoration:none}
 
-/* ── Header — a serif two-tone wordmark on the left, monospace pills on the
+/* ── Header — a serif wordmark on the left, monospace pills on the
    right. The split does the work the old flat "// stream" label couldn't:
    the brand reads as typography, the controls read as chrome, and nothing
    competes with the cover art below. Pill geometry (999px radius, .72rem
@@ -6041,17 +6486,67 @@ body.light header{border-bottom-color:rgba(0,0,0,.08)}
    which never shows this button at all. */
 #topbar-back{
   display:none;align-items:center;justify-content:center;flex-shrink:0;
-  width:28px;height:28px;margin-right:.1rem;
+  width:36px;height:36px;margin:-4px .3rem -4px -8px;
   background:none;border:none;border-radius:50%;color:var(--text);cursor:pointer;
-  transition:background-color .15s ease,color .15s ease;
+  transition:background-color .15s ease;
 }
-#topbar-back svg{width:16px;height:16px}
-#topbar-back:hover{background:rgba(255,255,255,.08);color:var(--gold)}
+#topbar-back svg{width:20px;height:20px}
+#topbar-back:hover{background:rgba(255,255,255,.08)}
 body.light #topbar-back:hover{background:rgba(0,0,0,.06)}
-.wordmark{font-family:var(--font-serif);font-size:1.1rem;font-weight:700;letter-spacing:.03em;color:var(--text);white-space:nowrap;margin-right:.35rem;cursor:pointer}
-.wordmark span{color:var(--gold);font-weight:400;font-style:italic}
+.wordmark{font-family:var(--font-serif);font-size:1.3rem;font-weight:700;letter-spacing:-.01em;color:var(--text);white-space:nowrap;margin-right:.35rem;cursor:pointer}
+
+/* Search pill -- the reference's "search library" field, but still the same
+   button that opens the search/download overlay. */
+.hdr-search{display:inline-flex;align-items:center;gap:.55rem;height:2.25rem;padding:0 .7rem 0 .75rem;
+  width:15rem;border-radius:999px;background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.1);
+  color:var(--muted);cursor:text;font-family:var(--font-mono);font-size:.78rem;text-align:left;
+  transition:background .2s,border-color .2s;margin:-4px 0}
+.hdr-search:hover{background:rgba(255,255,255,.11);border-color:rgba(255,255,255,.18)}
+.hdr-search svg{width:.95rem;height:.95rem;flex-shrink:0}
+.hdr-search-l{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.hdr-search kbd{font-family:var(--font-mono);font-size:.68rem;color:var(--muted);opacity:.7;border:1px solid rgba(255,255,255,.12);border-radius:4px;padding:1px 5px}
+body.light .hdr-search{background:rgba(0,0,0,.05);border-color:rgba(0,0,0,.1)}
+body.light.has-hero #topbar:not(.is-solid) .hdr-search{background:rgba(255,255,255,.1);border-color:rgba(255,255,255,.16);color:#d6d6d6}
 .spacer{flex:1}
 .pill{font-size:.72rem;font-weight:500;letter-spacing:.06em;color:var(--muted);border:1px solid var(--border);padding:.3rem .8rem;border-radius:999px;white-space:nowrap}
+
+/* The title of whatever's open -- a movie, a show, a playlist -- set by
+   renderGrid alongside has-hero below. Only ever shown once the bar itself
+   has gone solid (see .is-solid .crumb): against the bare transparent strip
+   at the very top of a backdrop it would just be floating text with nothing
+   to anchor it to. */
+.crumb{font-family:var(--font-mono);font-size:.78rem;color:var(--muted);opacity:0;transform:translateY(4px);
+  transition:opacity .3s ease,transform .3s ease;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:220px}
+.crumb::before{content:"/";color:var(--border);margin-right:.6rem}
+.crumb:empty{display:none}
+
+/* ── Floating header (home hero, movie/show detail) ──────────────────────
+   Those pages' backdrop runs edge to edge under the bar (.hero-bd,
+   .fd-backdrop); renderGrid toggles body.has-hero exactly while one is on
+   screen, so every other screen keeps the original solid, sticky bar. ── */
+body.has-hero #topbar{
+  position:fixed;top:0;left:0;right:0;z-index:20;
+  background-color:transparent;background-image:none;
+  transition:background-color .3s ease,backdrop-filter .3s ease;
+}
+body.has-hero header{border-bottom-color:transparent;transition:border-color .3s ease}
+body.has-hero #topbar.is-solid header{border-bottom-color:rgba(255,255,255,.06)}
+body.has-hero #topbar:not(.is-solid) .wordmark,
+body.has-hero #topbar:not(.is-solid) #topbar-back{color:#f2f2f2}
+body.has-hero #topbar::before{
+  content:"";position:absolute;inset:0 0 -40px 0;z-index:-1;pointer-events:none;
+  background:linear-gradient(to bottom,rgba(0,0,0,.5),rgba(0,0,0,0));transition:opacity .3s ease;
+}
+body.has-hero #topbar.is-solid::before{opacity:0}
+body.has-hero #topbar.is-solid{
+  background-color:var(--bg);
+  background-image:radial-gradient(80% 55% at 50% 0%, color-mix(in oklch, var(--tint, rgb(154,125,74)) 28%, transparent), transparent 72%);
+  background-size:100% 100vh;background-repeat:no-repeat;background-position:left top;
+  backdrop-filter:blur(14px) saturate(1.15);-webkit-backdrop-filter:blur(14px) saturate(1.15);
+}
+body.light.has-hero #topbar.is-solid{background-image:radial-gradient(80% 55% at 50% 0%, color-mix(in oklch, var(--tint, rgb(154,125,74)) 17%, transparent), transparent 72%)}
+body.has-hero .crumb{color:#cfcfcf}
+body.has-hero #topbar.is-solid .crumb{opacity:1;transform:none}
 
 /* ── Section chips ─────────────────────────────────────────────────────────
    The bar had a wide empty middle and the wall below it now has named
@@ -6408,7 +6903,7 @@ body.light .card:hover .pc-cover,body.light .card:focus-visible .pc-cover{box-sh
    focuses it in some browsers, which otherwise drew this same outline on
    nothing more than a click -- :focus-visible's own heuristic already knows
    to skip that and only show for keyboard/remote navigation. */
-.card:focus-visible,.lr:focus-visible,.ep-row:focus-visible,.sv-ep-row:focus-visible,.cw-card:focus-visible,.hero-btn:focus-visible{outline:2px solid rgba(255,255,255,.55);outline-offset:2px}
+.card:focus-visible,.lr:focus-visible,.ep-row:focus-visible,.sv-ep-row:focus-visible,.cw-card:focus-visible,.hdr-search:focus-visible,.fd-btn:focus-visible{outline:2px solid rgba(255,255,255,.55);outline-offset:2px}
 
 /* ── POSTER cards — a gallery, not a data grid: cover art does the work,
    nothing sits on top of it. Dark theme hovers via a brightness lift; the
@@ -6562,21 +7057,25 @@ body.light .pl-card:hover .pl-cover{box-shadow:0 0 16px 1px rgba(40,30,20,.32)}
 
 /* Hero — the one thing on the page allowed to be bigger than everything else.
    Uses the tmdb_backdrop that 72% of entries carry and the grid never showed. */
-.hero{grid-column:1/-1;position:relative;border-radius:8px;overflow:hidden;margin-bottom:.4rem;cursor:pointer;
-  min-height:340px;display:flex;align-items:flex-end;background:var(--bg)}
-.hero img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;object-position:center 22%}
+/* Full-bleed like index (2).html: the header floats over it (body.has-hero),
+   the backdrop breaks out of #file-grid through the absolute .fd-backdrop
+   (never the grid item itself -- see .fd-wrap), and the copy sits bottom-left
+   over a scrim tinted from the film's own --tint. */
+.hero{grid-column:1/-1;position:relative;margin-bottom:.6rem;cursor:pointer;
+  height:min(70vh,720px);min-height:440px;display:flex;align-items:flex-end}
+.hero .fd-backdrop img{width:100%;height:100%;object-fit:cover;object-position:center top;display:block}
 .hero-scrim{position:absolute;inset:0;
-  background:linear-gradient(to right,rgba(10,10,10,.95) 0%,rgba(10,10,10,.72) 42%,rgba(10,10,10,.15) 82%),
-             linear-gradient(to top,rgba(10,10,10,.9),transparent 55%)}
-.hero-in{position:relative;z-index:2;padding:1.5rem 1.6rem;max-width:min(560px,72%)}
-.hero-kicker{font-family:var(--font-mono);font-size:.66rem;letter-spacing:.13em;text-transform:uppercase;color:var(--gold);margin-bottom:.45rem}
-.hero-t{font-family:var(--font-serif);font-size:1.9rem;font-weight:700;color:#fff;line-height:1.12;margin-bottom:.5rem;text-wrap:balance}
-.hero-d{font-family:var(--font-sans);font-size:.85rem;line-height:1.6;color:#cfc9bf;margin-bottom:.9rem;
-  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
-.hero-btn{display:inline-flex;align-items:center;gap:.45rem;font-family:var(--font-mono);font-size:.75rem;
-  letter-spacing:.09em;color:#0a0a0a;background:var(--gold);border:none;padding:.5rem 1.15rem;
-  border-radius:3px;cursor:pointer;transition:filter .15s}
-.hero-btn:hover{filter:brightness(1.12)}
+  background:
+    linear-gradient(to right,rgba(10,10,10,.85) 0%,rgba(10,10,10,.45) 40%,rgba(10,10,10,0) 70%),
+    linear-gradient(to bottom,rgba(0,0,0,.4) 0%,rgba(0,0,0,0) 18%,rgba(0,0,0,0) 55%,rgba(10,10,10,.85) 100%)}
+.hero-in{position:relative;z-index:1;padding:2.4rem 0 2.8rem;max-width:min(620px,60%)}
+.hero-in .fd-title{font-size:3.4rem;line-height:1.05;letter-spacing:-.02em;margin-bottom:.8rem;text-shadow:0 2px 30px rgba(0,0,0,.35)}
+.hero-in .fd-overview{display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
+.hero-in .fd-btn{height:2.9rem;padding:0 1.3rem;font-size:.95rem}
+.hero-in .fd-btn svg{width:1rem;height:1rem;flex-shrink:0}
+.hero-in .fd-btn-play{box-shadow:0 6px 24px rgba(217,40,45,.3)}
+.hero-in .fd-btn-ghost{backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px)}
+.fd-time{font-family:var(--font-mono);font-weight:400;font-size:.8rem;opacity:.85}
 
 .pc-info{padding:.6rem .05rem .15rem}
 .pc-title{font-family:var(--font-sans);font-size:12px;font-weight:400;color:#d0d0d0;line-height:1.3;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;margin-bottom:.2rem}
@@ -6667,6 +7166,55 @@ body.light .card:hover .mv2-cover img{filter:none}
 .fm-collection span{color:var(--gold);cursor:pointer}
 .fm-collection span:hover{text-decoration:underline}
 
+/* ── Film detail (movies only) — full-bleed backdrop, no poster, title and
+   actions anchored bottom-left on the image itself. Lives alongside (not
+   instead of) .sv-* above: the show detail page keeps its own poster+tabs
+   layout untouched, these classes are fd-wrap's own. fd-wrap also carries
+   sv-wrap so it still slots into #file-grid's layout the same way. ── */
+/* fd-wrap itself stays exactly as wide as #file-grid's column area: only the
+   absolutely-positioned backdrop breaks out to the full viewport. A grid item
+   with its own 100vw width would make #file-grid widen its column tracks to
+   fit it, dragging the credits grid and extras rows off-screen with it;
+   absolute children take no part in grid sizing. */
+.fd-wrap{position:relative;margin-bottom:.4rem;
+  height:min(82vh,860px);min-height:460px;display:flex;align-items:flex-end}
+/* --vw is the visible width (set from clientWidth in the script); 100vw would
+   also count the scrollbar and leave a strip of backdrop under it. The mask
+   fades the image's bottom edge into the page instead of ending on a line. */
+.fd-backdrop{position:absolute;top:0;bottom:0;left:calc(50% - var(--vw,100vw)/2);width:var(--vw,100vw);overflow:hidden;z-index:0;
+  -webkit-mask-image:linear-gradient(to bottom,#000 0%,#000 62%,transparent 100%);
+          mask-image:linear-gradient(to bottom,#000 0%,#000 62%,transparent 100%)}
+/* Anchored to the top edge: TMDB backdrops put faces in the upper part of the
+   frame, and a centred crop of a wide image into this tall box cut them off. */
+.fd-backdrop img{width:100%;height:100%;object-fit:cover;object-position:center top;display:block}
+.fd-scrim{position:absolute;inset:0;
+  background:linear-gradient(to right,rgba(10,10,10,.92) 0%,rgba(10,10,10,.55) 45%,rgba(10,10,10,.1) 80%),
+             linear-gradient(to top,rgba(10,10,10,.95) 0%,rgba(10,10,10,0) 55%,rgba(10,10,10,.08) 100%)}
+.fd-body{position:relative;z-index:1;padding:2.4rem 0 2.6rem;max-width:min(640px,72%)}
+.fd-eyebrow{font-family:var(--font-mono);font-size:.7rem;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);margin-bottom:.7rem}
+.fd-eyebrow b{font-weight:400;color:var(--text)}
+.fd-title{font-family:var(--font-serif);font-size:2.3rem;font-weight:700;color:#fff;line-height:1.1;letter-spacing:-.01em;margin:0 0 .6rem;text-wrap:balance}
+.fd-meta{font-family:var(--font-mono);font-size:.82rem;color:var(--muted);margin-bottom:.9rem}
+.fd-meta-sep{color:var(--border);margin:0 .5rem}
+.fd-rating{color:var(--gold)}
+.fd-overview{font-family:var(--font-sans);font-size:.95rem;line-height:1.65;color:#d6d6d6;max-width:56ch;margin:0 0 1.4rem}
+.fd-actions{display:flex;flex-wrap:wrap;align-items:center;gap:.6rem}
+.fd-btn{display:inline-flex;align-items:center;gap:.5rem;height:42px;padding:0 1.2rem;border-radius:999px;border:none;cursor:pointer;
+  font-family:var(--font-sans);font-weight:500;font-size:.88rem;white-space:nowrap;transition:background .15s}
+.fd-btn-play{position:relative;overflow:hidden;background:var(--play);color:#fff}
+.fd-btn-play:hover{background:var(--play-lit)}
+.fd-prog{position:absolute;left:0;bottom:0;height:3px;width:100%;background:rgba(0,0,0,.25)}
+.fd-prog i{display:block;height:100%;width:var(--p);background:#fff}
+.fd-btn-ghost{background:rgba(255,255,255,.1);color:var(--text);border:1px solid rgba(255,255,255,.16)}
+.fd-btn-ghost:hover{background:rgba(255,255,255,.17)}
+.fd-round{width:42px;padding:0;justify-content:center;text-align:center;text-decoration:none}
+.fd-left{font-family:var(--font-mono);font-size:.72rem;color:var(--muted);margin-left:.2rem}
+/* Show detail: the movie layout plus its cover, bottom-aligned with the text. */
+.fd-body-show{display:flex;align-items:flex-end;gap:2rem;max-width:min(880px,92%)}
+.fd-poster{flex-shrink:0;width:150px;aspect-ratio:2/3;border-radius:6px;object-fit:cover;box-shadow:0 10px 36px rgba(0,0,0,.55)}
+.fd-poster-ph{display:flex;align-items:center;justify-content:center;background:var(--bg2);font-size:2.5rem}
+.fd-text{flex:1;min-width:0}
+
 /* ── Responsive ───────────────────────────────────────────────────────────── */
 @media(max-width:900px){
   .sv-hero-top{gap:32px}
@@ -6685,13 +7233,16 @@ body.light .card:hover .mv2-cover img{filter:none}
   header{padding:.7rem var(--gutter);gap:.35rem;flex-wrap:nowrap}
   .wordmark{font-size:.92rem;margin-right:0}
   .pill{display:none}
-  #search-open-btn{display:none}
+  .hdr-search{width:2.25rem;padding:0;justify-content:center;background:transparent;border-color:transparent;cursor:pointer}
+  .hdr-search-l,.hdr-search kbd{display:none}
+  .hdr-search svg{width:1.1rem;height:1.1rem}
   .header-btn{padding:.3rem .62rem;font-size:.68rem;letter-spacing:.04em}
   .view-btn{width:27px;height:27px;font-size:.9rem}
-  .hero{min-height:0;aspect-ratio:16/10}
-  .hero-in{padding:1.05rem 1.1rem;max-width:100%}
-  .hero-t{font-size:1.3rem}
-  .hero-d{font-size:.78rem}
+  .hero{height:auto;min-height:0;padding-top:48vh}
+  .hero-in{padding:0 0 1.4rem;max-width:100%}
+  .hero-in .fd-title{font-size:1.9rem}
+  .hero-in .fd-overview{font-size:.88rem}
+  .hero-in .fd-btn{height:40px;padding:0 1rem;font-size:.84rem}
   .cw-rail{grid-template-columns:repeat(auto-fill,minmax(165px,1fr));gap:12px}
   .rail-head{margin:1.4rem 0 .1rem}
   .rail-head .rh-t{font-size:.92rem}
@@ -6705,20 +7256,26 @@ body.light .card:hover .mv2-cover img{filter:none}
   /* Touch has no hover, so an on-demand caption would never appear — the
      overlay becomes permanent rather than the title becoming unreachable. */
   .pc-ovl{opacity:1;background:linear-gradient(to top,rgba(0,0,0,.9) 0%,rgba(0,0,0,.3) 42%,transparent 66%)}
+  .fd-wrap{height:auto;min-height:0;padding-top:52vh}
+  .fd-body{max-width:100%;padding-bottom:1.4rem}
+  .fd-title{font-size:1.5rem}
+  .fd-overview{font-size:.88rem}
+  .fd-btn{height:40px;padding:0 1rem;font-size:.84rem}
+  .fd-left{width:100%;margin:.1rem 0 0}
+  .fd-body-show{max-width:100%;gap:1rem;align-items:flex-start;flex-direction:column}
+  .fd-poster{width:96px}
   .pc-ovl-t{font-size:.7rem;-webkit-line-clamp:2}
   .pc-ovl-y{font-size:.6rem}
 }
 
 /* Smallest phones: the bar runs out of room before the controls do, so the
-   wordmark drops its second half rather than a control disappearing —
-   "Stream" alone still carries the mark, a missing view toggle would not. */
+   wordmark shrinks rather than a control disappearing. */
 @media(max-width:400px){
   .wordmark{font-size:.88rem}
-  .wordmark span{display:none}
   .header-btn{padding:.28rem .55rem;font-size:.66rem}
   .view-btn{width:26px;height:26px}
-  #topbar-back{width:26px;height:26px}
-  #topbar-back svg{width:15px;height:15px}
+  #topbar-back{width:32px;height:32px}
+  #topbar-back svg{width:18px;height:18px}
   #file-grid{gap:14px;grid-template-columns:repeat(auto-fill,minmax(130px,1fr))}
   #music-grid{grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:16px}
   #other-grid{gap:14px;grid-template-columns:repeat(auto-fill,minmax(130px,1fr))}
@@ -7150,13 +7707,20 @@ html.media-paused #modal{animation-play-state:paused}
 <div id="ctx-menu" role="menu"></div>
 <div id="topbar">
 <header>
-  <button id="topbar-back" aria-label="Back to library" tabindex="0"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M15.41 7.41L14 6l-6 6 6 6 1.41-1.41L10.83 12z"/></svg></button>
-  <span class="wordmark" id="wordmark-home" role="button" tabindex="0" aria-label="Home">Stream<span>Videos</span></span>
+  <button id="topbar-back" aria-label="Back to library" tabindex="0"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 18l-6-6 6-6"/></svg></button>
+  <span class="wordmark" id="wordmark-home" role="button" tabindex="0" aria-label="Home">Stream</span>
+  <span class="crumb" id="topbar-crumb"></span>
   <span class="spacer"></span>
-  <button class="view-btn" id="btn-view" title="Switch between poster and list view" tabindex="0">⊞</button>
-  <button class="header-btn" id="theme-toggle-btn" title="Toggle light/dark theme" tabindex="0">light</button>
-  <a href="/qr.png" target="_blank"><button class="header-btn" tabindex="0">qr</button></a>
-  <button class="header-btn mgmt" id="search-open-btn" tabindex="0">search</button>
+  <button class="hdr-search mgmt" id="search-open-btn" aria-label="Search" tabindex="0">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>
+    <span class="hdr-search-l">search library</span>
+    <kbd>/</kbd>
+  </button>
+  <!-- No longer offered in the bar; kept so setView/setTheme still have their elements. -->
+  <div hidden>
+    <button class="view-btn" id="btn-view" tabindex="-1">⊞</button>
+    <button class="header-btn" id="theme-toggle-btn" tabindex="-1">light</button>
+  </div>
 </header>
 </div>
 <nav id="section-tags"></nav>
@@ -7171,6 +7735,7 @@ html.media-paused #modal{animation-play-state:paused}
     <div id="search-kind">
       <button class="sk-btn active" data-kind="media">Films &amp; TV</button>
       <button class="sk-btn" data-kind="music">Music videos</button>
+      <button class="sk-btn" data-kind="soundcloud">SoundCloud</button>
     </div>
     <div id="search-tv-opts">
       <div id="search-selected"></div>
@@ -7261,6 +7826,10 @@ var lastLocalSig = null;    // last /local/files payload, so a poll that changed
 var lastCloudSig = null;
 var progressKey = null;     // key of the file modalVideo is currently tracking, or null if nothing to resume
 var lastProgressPost = 0;   // ms timestamp of the last /api/progress POST, for throttling
+// Set just before calling openFile from the movie detail page's "Start over"
+// button, consumed once by resumePlayback and cleared immediately after, so
+// it can never leak into the next, unrelated playback.
+var forceFromStart = false;
 var lastFocusedCard = null; // card/row that was focused before the modal opened, restored on close
 var modalInHistory = false; // true while the open player owns a history entry
 var closingFromPop = false; // guards closeModal against calling back() during a popstate
@@ -7480,6 +8049,37 @@ if (wordmarkHome) {
     if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); goHome(); }
   });
 }
+
+// ── Floating header (home hero, movie/show detail) ───────────────────────
+// body.has-hero is toggled by renderGrid, exactly while a full-bleed
+// backdrop is behind the bar. Scrolling far enough that the backdrop itself
+// has scrolled under the header turns the bar solid.
+var topbarCrumb = document.getElementById('topbar-crumb');
+function onTopbarScroll() {
+  if (!document.body.classList.contains('has-hero')) return;
+  document.getElementById('topbar').classList.toggle('is-solid', window.scrollY > 140);
+}
+window.addEventListener('scroll', onTopbarScroll, {passive:true});
+
+// Full-bleed backdrops size themselves to --vw rather than 100vw: 100vw
+// includes the vertical scrollbar, which left a grey strip under it.
+function syncViewportWidth() {
+  document.documentElement.style.setProperty('--vw', document.documentElement.clientWidth + 'px');
+}
+syncViewportWidth();
+window.addEventListener('resize', syncViewportWidth);
+if (window.ResizeObserver) new ResizeObserver(syncViewportWidth).observe(document.documentElement);
+
+// "/" opens search, as in the reference header -- unless already typing.
+document.addEventListener('keydown', function(e){
+  if (e.key !== '/' || e.ctrlKey || e.metaKey || e.altKey) return;
+  var t = e.target, tag = t && t.tagName;
+  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || (t && t.isContentEditable)) return;
+  var btn = document.getElementById('search-open-btn');
+  if (!btn || getComputedStyle(btn).display === 'none') return;
+  e.preventDefault();
+  btn.click();
+});
 var modal      = document.getElementById('modal');
 var modalVideo = document.getElementById('modal-video');
 var modalNote  = document.getElementById('modal-note');
@@ -7509,6 +8109,8 @@ function setView(v) {
     musicGrid.style.display = 'none';
     musicHeading.style.display = 'none';
     fileList.style.display = 'block';
+    document.body.classList.remove('has-hero');
+    document.getElementById('topbar').classList.remove('is-solid');
     btnView.textContent = '\u2261';
     btnView.title = 'List view \u2014 switch to posters';
     renderList(currentFiles);
@@ -7521,7 +8123,9 @@ function setView(v) {
   }
 }
 btnView.addEventListener('click', function(){ setView(viewMode === 'list' ? 'poster' : 'list'); });
-var viewMode = lsGet('stream-view') === 'list' ? 'list' : 'poster';
+// The view toggle is no longer in the header, so a saved 'list' would leave
+// no way back -- always start on the poster wall.
+var viewMode = 'poster';
 setView(viewMode);
 
 // ── Theme toggle ───────────────────────────────────────────────────────────
@@ -7534,7 +8138,8 @@ function setTheme(t) {
 themeToggleBtn.addEventListener('click', function(){
   setTheme(document.body.classList.contains('light') ? 'dark' : 'light');
 });
-setTheme(lsGet('stream-theme') || 'dark');
+// Same for the theme toggle: with no control left to switch back, start dark.
+setTheme('dark');
 
 // ── Remote vs local: hide management UI when viewing through the tunnel ──────
 document.body.classList.toggle('remote', !IS_LOCAL);
@@ -8302,29 +8907,58 @@ function renderShowView(show) {
     currentSeason = seasons[0];
   }
 
+  // What the main button plays: the most recently watched unfinished episode
+  // of the whole show if there is one (Resume, with Start over beside it),
+  // otherwise the first episode of the season tab that's open.
+  var resumeEp = null, resumeP = null;
+  episodes.forEach(function(f){
+    var fp = progressOf(f);
+    if (fp && (!resumeP || (fp.updated || 0) > (resumeP.updated || 0))) { resumeEp = f; resumeP = fp; }
+  });
+  var seasonFirst = episodes.filter(function(f){ return (f.season||0) === currentSeason; })[0] || episodes[0];
+  var playEp = resumeEp || seasonFirst;
+  var epCode = function(f){
+    return f && f.season && f.episode ? 'S' + pad2(f.season) + 'E' + pad2(f.episode) : '';
+  };
+  var playLabel = resumeEp
+    ? 'Resume ' + epCode(resumeEp) + (epCode(resumeEp) ? ' · ' : '') + fmtDur(Math.round(resumeP.position))
+    : 'Play' + (epCode(playEp) ? ' ' + epCode(playEp) : '');
+  var pct = resumeP ? Math.max(2, Math.min(100, (resumeP.position / resumeP.duration) * 100)) : 0;
+
+  var metaBits = [];
+  if (ep.year) metaBits.push('<span>' + ep.year + '</span>');
+  if (seasons.length) metaBits.push('<span>' + seasons.length + (seasons.length === 1 ? ' season' : ' seasons') + '</span>');
+  if (ep.rating) metaBits.push('<span class="fd-rating">' + ep.rating.toFixed(1) + '</span>');
+  var metaLine = metaBits.join('<span class="fd-meta-sep">·</span>');
+  if (ep.genres && ep.genres.length) {
+    metaLine += (metaLine ? '<span class="fd-meta-sep">·</span>' : '') + esc(ep.genres.join(', '));
+  }
+
+  // Same layout as the movie page (fd-*), except the cover stays, beside the
+  // text rather than floating over the backdrop's edge.
   var wrap = document.createElement('div');
-  wrap.className = 'sv-wrap';
+  wrap.className = 'sv-wrap fd-wrap fd-show';
   wrap.innerHTML =
-    '<div class="sv-backdrop">' +
+    '<div class="fd-backdrop">' +
       (backdropSrc ? '<img src="'+esc(backdropSrc)+'">' : '') +
-      '<div class="sv-backdrop-fade"></div>' +
+      '<div class="fd-scrim"></div>' +
     '</div>' +
-    '<div class="sv-hero">' +
-      '<div class="sv-hero-top">' +
-        (posterSrc ? '<img class="sv-poster" src="'+esc(posterSrc)+'">' : '<div class="sv-poster sv-poster-ph">📺</div>') +
-        '<div class="sv-info">' +
-          '<h2 class="sv-title">'+esc(ep.title || '')+'</h2>' +
-          '<div class="sv-meta">' +
-            (ep.year?'<span>'+ep.year+'</span>':'') +
-            (ep.year && seasons.length>1?'<span class="sv-meta-sep">·</span>':'') +
-            (seasons.length>1?'<span>'+seasons.length+' seasons</span>':'') +
-            (ep.rating?'<span class="sv-meta-sep">·</span><span class="sv-rating">'+ep.rating.toFixed(1)+'</span>':'') +
-          '</div>' +
-          (ep.genres && ep.genres.length ? '<div class="sv-genres">'+esc(ep.genres.join(' · '))+'</div>' : '') +
-        '</div>' +
+    '<div class="fd-body fd-body-show">' +
+      (posterSrc ? '<img class="fd-poster" src="'+esc(posterSrc)+'" alt="">' : '<div class="fd-poster fd-poster-ph">📺</div>') +
+      '<div class="fd-text">' +
+        '<div class="fd-eyebrow">' + (ep.director ? 'Created by <b>'+esc(ep.director)+'</b>' : 'Series') + '</div>' +
+        '<h2 class="fd-title">'+esc(ep.title || '')+'</h2>' +
+        (metaLine ? '<div class="fd-meta">'+metaLine+'</div>' : '') +
+        (ep.overview ? '<p class="fd-overview">'+esc(ep.overview)+'</p>' : '') +
+        (playEp ? '<div class="fd-actions">' +
+          '<button class="fd-btn fd-btn-play" style="--p:'+pct+'%" onclick="openFile(event,\''+esc(playEp.key)+'\',false)">' +
+            '▶ '+esc(playLabel)+'<span class="fd-prog"><i></i></span>' +
+          '</button>' +
+          (resumeEp ? '<button class="fd-btn fd-btn-ghost" onclick="startOverMovie(event,\''+esc(resumeEp.key)+'\')">↺ Start over</button>' : '') +
+          '<a class="fd-btn fd-btn-ghost fd-round" href="/qr.png" target="_blank" aria-label="Open on phone" title="Open on phone">qr</a>' +
+          (resumeP ? '<span class="fd-left">'+esc(fmtLeft(resumeP))+'</span>' : '') +
+        '</div>' : '') +
       '</div>' +
-      (ep.overview ? '<p class="sv-overview">'+esc(ep.overview)+'</p>' : '') +
-      '<button class="sv-play-btn" id="sv-play-btn" aria-label="Play"></button>' +
     '</div>';
   fileGrid.appendChild(wrap);
 
@@ -8341,17 +8975,6 @@ function renderShowView(show) {
     });
     fileGrid.appendChild(picker);
     episodes = episodes.filter(function(f){ return (f.season||0) === currentSeason; });
-  }
-
-  var playBtn = document.getElementById('sv-play-btn');
-  if (playBtn) {
-    var first = episodes[0];
-    var label = first && first.season && first.episode
-      ? 'S' + pad2(first.season) + 'E' + pad2(first.episode)
-      : 'Play';
-    playBtn.setAttribute('aria-label', 'Play ' + label);
-    playBtn.title = 'Play ' + label;
-    if (first) playBtn.addEventListener('click', function(e){ openFile(e, first.key, false); });
   }
 
   episodes.forEach(function(f) {
@@ -8418,37 +9041,52 @@ function renderMovieView(main, extras) {
   clearTimeout(tintPending);
   withTint(backdropSrc || posterSrc, applyTint);
 
-  // Cinematic hero — same layout as series detail
+  // Full-bleed backdrop, no poster — the backdrop already carries the art.
+  // Title/meta/overview/actions sit bottom-left on top of it, the same
+  // surface the header floats over (see body.has-hero in the CSS and
+  // renderGrid, which sets that class for exactly this page and the show
+  // detail page's own sv-backdrop).
+  var p = progressOf(main);
+  var pct = p ? Math.max(2, Math.min(100, (p.position / p.duration) * 100)) : 0;
+  // Positions are fractional seconds; fmtDur wants whole ones.
+  var playLabel = p ? 'Resume ' + fmtDur(Math.round(p.position)) : 'Play';
+  var metaBits = [];
+  if (main.year) metaBits.push('<span>' + main.year + '</span>');
+  if (main.runtime) metaBits.push('<span>' + main.runtime + ' min</span>');
+  if (main.rating) metaBits.push('<span class="fd-rating">' + main.rating.toFixed(1) + '</span>');
+  var metaLine = metaBits.join('<span class="fd-meta-sep">·</span>');
+  if (main.genres && main.genres.length) {
+    metaLine += (metaLine ? '<span class="fd-meta-sep">·</span>' : '') + esc(main.genres.join(', '));
+  }
+
   var wrap = document.createElement('div');
-  wrap.className = 'sv-wrap';
+  wrap.className = 'sv-wrap fd-wrap';
   wrap.innerHTML =
-    '<div class="sv-backdrop">' +
+    '<div class="fd-backdrop">' +
       (backdropSrc ? '<img src="'+esc(backdropSrc)+'">' : '') +
-      '<div class="sv-backdrop-fade"></div>' +
+      '<div class="fd-scrim"></div>' +
     '</div>' +
-    '<div class="sv-hero">' +
-      '<div class="sv-hero-top">' +
-        (posterSrc ? '<img class="sv-poster" src="'+esc(posterSrc)+'">' : '<div class="sv-poster sv-poster-ph">🎬</div>') +
-        '<div class="sv-info">' +
-          '<h2 class="sv-title">'+esc(main.title || main.name)+'</h2>' +
-          '<div class="sv-meta">' +
-            (main.year ? '<span>'+main.year+'</span>' : '') +
-            (main.runtime ? '<span class="sv-meta-sep">·</span><span>'+main.runtime+' min</span>' : '') +
-            (main.rating ? '<span class="sv-meta-sep">·</span><span class="sv-rating">'+main.rating.toFixed(1)+'</span>' : '') +
-          '</div>' +
-          (main.genres && main.genres.length ? '<div class="sv-genres">'+esc(main.genres.join(' · '))+'</div>' : '') +
-        '</div>' +
+    '<div class="fd-body">' +
+      (main.director ? '<div class="fd-eyebrow">A film by <b>'+esc(main.director)+'</b></div>' : '') +
+      '<h2 class="fd-title">'+esc(main.title || main.name)+'</h2>' +
+      (metaLine ? '<div class="fd-meta">'+metaLine+'</div>' : '') +
+      (main.overview ? '<p class="fd-overview">'+esc(main.overview)+'</p>' : '') +
+      '<div class="fd-actions">' +
+        '<button class="fd-btn fd-btn-play" style="--p:'+pct+'%" onclick="openFile(event,\''+esc(main.key)+'\',false,true)">' +
+          '▶ '+playLabel+'<span class="fd-prog"><i></i></span>' +
+        '</button>' +
+        (p ? '<button class="fd-btn fd-btn-ghost" onclick="startOverMovie(event,\''+esc(main.key)+'\')">↺ Start over</button>' : '') +
+        '<a class="fd-btn fd-btn-ghost fd-round" href="/qr.png" target="_blank" aria-label="Open on phone" title="Open on phone">qr</a>' +
+        (p ? '<span class="fd-left">'+esc(fmtLeft(p))+'</span>' : '') +
       '</div>' +
-      (main.overview ? '<p class="sv-overview">'+esc(main.overview)+'</p>' : '') +
-      '<button class="sv-play-btn" aria-label="Play" onclick="openFile(event,\''+esc(main.key)+'\',false,true)"></button>' +
     '</div>';
   fileGrid.appendChild(wrap);
 
-  // Metadata grid
+  // Metadata grid — Runtime is left out here: it's already in fd-meta above,
+  // and showing it twice was the one thing this redesign set out to fix.
   var cells = [];
   if (main.director) cells.push({label:'Director', value: esc(main.director)});
   if (main.cast && main.cast.length) cells.push({label:'Cast', value: esc(main.cast.join(', '))});
-  if (main.runtime) cells.push({label:'Runtime', value: main.runtime+' min'});
   if (main.country) cells.push({label:'Country', value: esc(main.country)});
   if (main.language) cells.push({label:'Language', value: esc(main.language)});
   // audio_lang is the language actually embedded in this file's default
@@ -8607,6 +9245,23 @@ function renderGrid(files) {
   updateNowPlayingWash(); // home wall vs. a detail page -- see updateNowPlayingWash
   if (topbarBack) topbarBack.style.display = (currentShow || currentMovieDetail || currentPlaylist) ? 'flex' : 'none';
   syncPlSidebarVisibility();
+
+  // The header only floats transparently where there's a full-bleed backdrop
+  // behind it to float over -- movie and show detail here, and the wall's
+  // own hero further down once it has rendered. Playlists and an empty
+  // library keep the original solid, sticky bar.
+  var hasHero = !!(currentShow || currentMovieDetail);
+  document.body.classList.toggle('has-hero', hasHero);
+  if (topbarCrumb) {
+    topbarCrumb.textContent = currentShow ? (currentShow.episodes[0].title || '')
+      : currentMovieDetail ? (currentMovieDetail.main.title || '')
+      : '';
+  }
+  // Re-evaluate immediately rather than waiting for the next scroll event --
+  // each detail page opens at scrollY 0, but #topbar can still be carrying
+  // is-solid from whatever page was open before this one.
+  if (hasHero) onTopbarScroll(); else document.getElementById('topbar').classList.remove('is-solid');
+
   // A detail page is one title, not a shelf, so the section list has nothing
   // to point at and is cleared rather than left showing the previous view's.
   // Unlike the wall below, these always do a full rebuild -- landing on a
@@ -8676,6 +9331,11 @@ function renderGrid(files) {
   var heroResume = heroPick(cands, Math.floor(Date.now() / HERO_WINDOW_MS));
   var hero = heroResume || pickHeroFilm(grouped.standalone);
   updateHero(hero, !!heroResume);
+  // The wall's hero is full-bleed too now, so the header floats over it
+  // exactly like on the detail pages.
+  var wallHero = viewMode !== 'list' && !!wallEls.hero.querySelector('.hero');
+  document.body.classList.toggle('has-hero', wallHero);
+  if (wallHero) onTopbarScroll(); else document.getElementById('topbar').classList.remove('is-solid');
   scheduleHeroRoll();
   setRailHead(wallEls.cwHead, 'Continue watching', cont.length);
   wallEls.cwRail.style.display = cont.length ? '' : 'none';
@@ -8919,32 +9579,56 @@ function renderHero(f, resuming) {
   var art = f.tmdb_backdrop || f.episode_still;
   if (!art) return null;
   var p = progressOf(f);
-  var kicker = (resuming && p)
-    ? 'Resume \u00b7 ' + fmtLeft(p)
-    : [f.media_type === 'tv' ? 'Series' : 'Film', f.year, f.rating ? '\u2605 ' + f.rating.toFixed(1) : '']
-        .filter(Boolean).join(' \u00b7 ');
-  var title = f.title || f.name;
-  var sub = (f.media_type === 'tv' && f.episode_title) ? f.episode_title : f.overview;
+  var isTV = f.media_type === 'tv';
+  var pct = p ? Math.max(2, Math.min(100, (p.position / p.duration) * 100)) : 0;
+  var epTag = (isTV && f.season != null && f.episode != null) ? 'S' + pad2(f.season) + 'E' + pad2(f.episode) : '';
+  var eyebrow = isTV
+    ? (f.director ? 'Created by <b>' + esc(f.director) + '</b>' : 'Series')
+    : (f.director ? 'A film by <b>' + esc(f.director) + '</b>' : 'Film');
+  var metaBits = [];
+  if (f.year) metaBits.push('<span>' + esc(String(f.year)) + '</span>');
+  if (epTag) metaBits.push('<span>' + epTag + (f.episode_title ? ' \u00b7 ' + esc(f.episode_title) : '') + '</span>');
+  else if (f.runtime) metaBits.push('<span>' + f.runtime + ' min</span>');
+  if (f.rating) metaBits.push('<span class="fd-rating">' + f.rating.toFixed(1) + '</span>');
+  var metaLine = metaBits.join('<span class="fd-meta-sep">\u00b7</span>');
+  if (f.genres && f.genres.length) {
+    metaLine += (metaLine ? '<span class="fd-meta-sep">\u00b7</span>' : '') + esc(f.genres.join(', '));
+  }
+  // Positions are fractional seconds; fmtDur wants whole ones.
+  var playLabel = p
+    ? 'Resume ' + (epTag ? epTag + ' ' : '') + '<span class="fd-time">' + fmtDur(Math.round(p.position)) + '</span>'
+    : 'Play' + (epTag ? ' ' + epTag : '');
+  var playIcon = '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M7 4.5v15a1 1 0 0 0 1.5.86l12.5-7.5a1 1 0 0 0 0-1.72L8.5 3.64A1 1 0 0 0 7 4.5z"/></svg>';
+  var infoIcon = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 8h.01"/></svg>';
   var el = document.createElement('div');
   el.className = 'hero';
   el.innerHTML =
-    '<img src="' + esc(art) + '" alt="" crossorigin="anonymous">' +
-    '<div class="hero-scrim"></div>' +
+    '<div class="fd-backdrop">' +
+      '<img src="' + esc(art) + '" alt="" crossorigin="anonymous">' +
+      '<div class="hero-scrim"></div>' +
+    '</div>' +
     '<div class="hero-in">' +
-      '<div class="hero-kicker">' + esc(kicker) + '</div>' +
-      '<div class="hero-t">' + esc(title) + '</div>' +
-      (sub ? '<div class="hero-d">' + esc(sub) + '</div>' : '') +
-      '<button class="hero-btn" tabindex="0">\u25b6 ' + (p ? 'RESUME' : 'PLAY') + '</button>' +
+      '<div class="fd-eyebrow">' + eyebrow + '</div>' +
+      '<h2 class="fd-title">' + esc(f.title || f.name) + '</h2>' +
+      (metaLine ? '<div class="fd-meta">' + metaLine + '</div>' : '') +
+      (f.overview ? '<p class="fd-overview">' + esc(f.overview) + '</p>' : '') +
+      '<div class="fd-actions">' +
+        '<button class="fd-btn fd-btn-play hero-play" style="--p:' + pct + '%" tabindex="0">' +
+          playIcon + playLabel + (p ? '<span class="fd-prog"><i></i></span>' : '') +
+        '</button>' +
+        '<button class="fd-btn fd-btn-ghost hero-details" tabindex="0">' + infoIcon + 'Details</button>' +
+        (p ? '<span class="fd-left">' + esc(fmtLeft(p)) + '</span>' : '') +
+      '</div>' +
     '</div>';
-  el.querySelector('.hero-btn').addEventListener('click', function(e){
+  el.querySelector('.hero-play').addEventListener('click', function(e){
     e.stopPropagation();
     openFile(e, f.key, false, true);
   });
   // Anywhere else on the banner opens the title rather than playing it —
   // resume is the one explicit action, everything else is "tell me more".
   el.addEventListener('click', function(e){
-    if (e.target.closest('.hero-btn')) return;
-    if (f.media_type === 'tv' && f.tmdb_id) {
+    if (e.target.closest('.hero-play')) return;
+    if (isTV && f.tmdb_id) {
       var eps = currentFiles.filter(function(x){ return x.media_type === 'tv' && x.tmdb_id === f.tmdb_id; });
       if (eps.length) { openShow({id: f.tmdb_id, episodes: eps}); return; }
     }
@@ -9481,6 +10165,14 @@ function renderList(files) {
 
 // ── Modal ──────────────────────────────────────────────────────────────────
 var currentMovieDetail = null;
+
+// startOverMovie is the movie detail page's "Start over" action: same as
+// clicking Play, except resumePlayback is told to ignore any saved position.
+function startOverMovie(e, key) {
+  if (e) e.stopPropagation();
+  forceFromStart = true;
+  openFile(e, key, false, true);
+}
 
 function openFile(e, key, isNote, skipDetailCheck) {
   if (e) e.stopPropagation();
@@ -10343,8 +11035,12 @@ function resumePlayback(video, key, opts) {
   lastProgressPost = 0;
   // A music video is three minutes long and gets rewatched, not continued.
   // Progress is still recorded — the continue-watching row and the bar on the
-  // card both still work — but playback always opens at the start.
-  if (opts && opts.fromStart) {
+  // card both still work — but playback always opens at the start. The same
+  // path serves the movie detail page's own "Start over", which forces it
+  // for a file that would otherwise resume.
+  var startOver = (opts && opts.fromStart) || forceFromStart;
+  forceFromStart = false;
+  if (startOver) {
     try { video.currentTime = 0; } catch (e) {}
     return;
   }
@@ -10716,6 +11412,8 @@ Array.prototype.forEach.call(document.querySelectorAll('.sk-btn'), function(b){
     });
     searchInput.placeholder = searchKind === 'music'
       ? 'search youtube for a music video\u2026'
+      : searchKind === 'soundcloud'
+      ? 'search soundcloud for a track\u2026'
       : 'search for a movie or show\u2026';
     searchTvOpts.style.display = 'none';
     searchResults.innerHTML = '';
@@ -10726,7 +11424,9 @@ Array.prototype.forEach.call(document.querySelectorAll('.sk-btn'), function(b){
 });
 
 function runSearch(q) {
-  if (searchKind === 'music') { doMusicSearch(q); } else { doTMDBSearch(q); }
+  if (searchKind === 'music') { doMusicSearch(q, 'youtube'); }
+  else if (searchKind === 'soundcloud') { doMusicSearch(q, 'soundcloud'); }
+  else { doTMDBSearch(q); }
 }
 
 searchInput.addEventListener('input', function(){
@@ -10735,7 +11435,7 @@ searchInput.addEventListener('input', function(){
   if (!q) { searchResults.innerHTML = ''; return; }
   // yt-dlp search is a process launch, so it gets a longer settle than the
   // TMDB one rather than firing on every keystroke.
-  var wait = searchKind === 'music' ? 650 : 400;
+  var wait = searchKind === 'media' ? 400 : 650;
   searchTimer = setTimeout(function(){ runSearch(q); }, wait);
 });
 
@@ -10745,6 +11445,10 @@ function fmtViews(n) {
   if (n >= 1e6) return (n/1e6).toFixed(1).replace(/\.0$/,'') + 'M views';
   if (n >= 1e3) return Math.round(n/1e3) + 'K views';
   return n + ' views';
+}
+
+function fmtPlays(n) {
+  return fmtViews(n).replace('views', 'plays');
 }
 
 // watchMusicFetch polls the server's job state so the button shows a real
@@ -10796,12 +11500,17 @@ function watchMusicFetch(url, title, btn) {
   })();
 }
 
-function doMusicSearch(q) {
+// source: 'youtube' or 'soundcloud' -- same rows and the same fetch flow;
+// the server turns a SoundCloud track into an MP4 of its cover art.
+function doMusicSearch(q, source) {
+  var sc = source === 'soundcloud';
   searchTvOpts.style.display = 'none';
-  searchResults.innerHTML = '<div class="sr-msg">searching youtube\u2026</div>';
-  fetch('/search/music?q=' + encodeURIComponent(q), {credentials:'include'})
+  searchResults.innerHTML = '<div class="sr-msg">searching ' + (sc ? 'soundcloud' : 'youtube') + '\u2026</div>';
+  fetch((sc ? '/search/soundcloud' : '/search/music') + '?q=' + encodeURIComponent(q), {credentials:'include'})
     .then(function(r){ return r.ok ? r.json() : Promise.reject(r.status); })
     .then(function(hits){
+      // A slow search for an earlier tab must not paint over the current one.
+      if (searchKind !== (sc ? 'soundcloud' : 'music')) return;
       searchResults.innerHTML = '';
       if (!hits || !hits.length) {
         searchResults.innerHTML = '<div class="sr-msg">no results</div>';
@@ -10811,7 +11520,10 @@ function doMusicSearch(q) {
         var row = document.createElement('div');
         row.className = 'sr-music';
         row.tabIndex = 0;
-        var meta = [h.channel, h.duration ? fmtDur(Math.round(h.duration)) : '', fmtViews(h.views)]
+        // Label-owned SoundCloud tracks stream as a 30-second clip to anyone
+        // without Go+, and that clip is all yt-dlp can fetch.
+        var preview = sc && Math.round(h.duration) === 30;
+        var meta = [h.channel, h.duration ? fmtDur(Math.round(h.duration)) : '', sc ? fmtPlays(h.views) : fmtViews(h.views)]
           .filter(Boolean).map(esc).join('  \u00b7  ');
         row.innerHTML =
           (h.thumbnail ? '<img class="sr-music-thumb" src="' + esc(h.thumbnail) + '" loading="lazy" alt="">'
@@ -10820,10 +11532,13 @@ function doMusicSearch(q) {
             '<div class="sr-music-t">' + esc(h.title) + '</div>' +
             '<div class="sr-music-m">' +
               (h.official ? '<span class="sr-official">official</span>' : '') +
+              (preview ? '<span class="sr-official" style="color:var(--muted);border-color:var(--muted)">30s preview</span>' : '') +
               '<span>' + meta + '</span>' +
             '</div>' +
           '</div>' +
-          '<button class="sr-dl-btn">\u2193 get</button>';
+          (preview ? '<button class="sr-dl-btn" disabled title="SoundCloud only offers a 30-second preview of this track">preview only</button>'
+                   : '<button class="sr-dl-btn">\u2193 get</button>');
+        if (preview) { searchResults.appendChild(row); return; }
         row.querySelector('.sr-dl-btn').addEventListener('click', function(e){
           e.stopPropagation();
           var btn = e.currentTarget;
@@ -10832,7 +11547,7 @@ function doMusicSearch(q) {
           fetch('/download/music', {
             method: 'POST', credentials: 'include',
             headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({url: h.url, title: h.title})
+            body: JSON.stringify({url: h.url, title: h.title, artist: h.channel || ''})
           }).then(function(r){
             if (!r.ok) throw new Error('failed');
             watchMusicFetch(h.url, h.title, btn);
@@ -11054,6 +11769,7 @@ func buildServer(c *serverCtx) *http.Server {
 	mux.HandleFunc("/search/tmdb/episodes", c.localOnly(c.handleTMDBEpisodes))
 	mux.HandleFunc("/search/torrents", c.localOnly(c.handleSearchTorrents))
 	mux.HandleFunc("/search/music", c.localOnly(c.handleSearchMusic))
+	mux.HandleFunc("/search/soundcloud", c.localOnly(c.handleSearchSoundCloud))
 	mux.HandleFunc("/api/history", c.handleHistory)
 	mux.HandleFunc("/windows-app/version", c.handleWindowsAppVersion)
 	mux.HandleFunc("/playlists", c.handlePlaylists)
@@ -11066,6 +11782,7 @@ func buildServer(c *serverCtx) *http.Server {
 	mux.HandleFunc("/local/subtitle", c.localOnly(c.handleLocalSubtitle))
 	mux.HandleFunc("/local/xspf", c.handleLocalXSPF)
 	mux.HandleFunc("/local/thumbnail", c.localOnly(c.handleLocalThumbnail))
+	mux.HandleFunc("/local/trickplay", c.localOnly(c.handleLocalTrickplay))
 	mux.HandleFunc("/", c.handleIndex)
 	return &http.Server{
 		Addr:              fmt.Sprintf(":%d", c.port),
